@@ -15,6 +15,7 @@ own runtime acceptance gates pass.
 | [Continuous batching](PR_1_CONTINUOUS_BATCHING.md) | Same-walk batching guards, paged-attention ownership, isolation/lifecycle gates, engine + worker integration harness, eager-only CUDA-graph scope | Continuous batching + paged attention on one GPU, once `benchmark/qwenvl_acceptance.py batch` reports every P1 gate `pass` on a CUDA + FlashInfer host |
 | [Tensor parallelism](PR_2_TENSOR_PARALLELISM.md) | TP topology, exact shard contracts, and TP2-vs-TP1 acceptance | Design only; distributed parity evidence required |
 | [Target-scale memory planning](PR_3_MEMORY_PLANNING.md) | Per-rank memory budgeting, admission, and sustained-run gates | Design only; target-hardware evidence required |
+| [Comparative performance](PR_4_PERFORMANCE.md) | Same-checkpoint MStar versus specialized-server benchmark protocol | Design only; reproducible benchmark evidence required |
 
 ## Evidence labels
 
