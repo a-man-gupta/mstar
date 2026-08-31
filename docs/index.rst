@@ -53,3 +53,4 @@ vision-language-action policies, and world models — through a **Python SDK**, 
 
    qwenvl/README
    qwenvl/PR_0_SINGLE_GPU_CORRECTNESS
+   qwenvl/PR_1_CONTINUOUS_BATCHING

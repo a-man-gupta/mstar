@@ -3,15 +3,16 @@
 This directory is the design record for the first QwenVL integration slice for
 MStar issue [#127](https://github.com/mstar-project/mstar/issues/127).
 
-PR 0 establishes only the single-GPU, non-tensor-parallel correctness baseline
-for `Qwen/Qwen3-VL-30B-A3B-Instruct`. It contains no claim about continuous
-batching, tensor parallelism, target-scale memory, or comparative performance.
+The stack begins with a single-GPU, non-tensor-parallel correctness baseline
+for `Qwen/Qwen3-VL-30B-A3B-Instruct`. Each later slice is design-only until its
+own runtime acceptance gates pass.
 
 ## Included design
 
 | Document | Scope | Merge claim allowed |
 | --- | --- | --- |
 | [Single-GPU correctness](PR_0_SINGLE_GPU_CORRECTNESS.md) | Official config/checkpoint mapping, image/text graph, MRoPE, bounded KV residency, and greedy decode | Local non-TP baseline only |
+| [Continuous batching](PR_1_CONTINUOUS_BATCHING.md) | Scheduler-level batching, paged-attention ownership, and isolation gates | Design only; CUDA integration evidence required |
 
 ## Evidence labels
 
