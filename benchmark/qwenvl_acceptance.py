@@ -1,9 +1,17 @@
-"""Collect real-checkpoint evidence for the QwenVL PR-0 acceptance gates.
+"""Collect evidence for the QwenVL acceptance gates.
 
-Run ``checkpoint`` on the same GPU that will serve the model, then start
-``mstar serve qwenvl`` and run ``server`` against it. Results are emitted as
-JSON so they can be attached to the PR without treating CPU tests as system
-acceptance.
+PR-0 (single-GPU correctness): run ``checkpoint`` on the same GPU that will
+serve the model, then start ``mstar serve qwenvl`` and run ``server`` against
+it.
+
+PR-1 (continuous batching + paged attention): run ``batch`` on a CUDA GPU with
+FlashInfer installed. It executes the PR1 integration suites
+(``test/integration/test_qwenvl_*.py``) plus the component test pinning the
+P1-G6 eager-only decision, and folds the per-test outcomes into a per-gate
+verdict (P1-G1 .. P1-G6).
+
+Results are emitted as JSON so they can be attached to the PR without treating
+CPU tests as acceptance.
 """
 
 from __future__ import annotations
@@ -11,11 +19,34 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import platform
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 DEFAULT_MODEL = "Qwen/Qwen3-VL-30B-A3B-Instruct"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+PR1_GATES = {
+    "P1-G1": "Each claimed batch shape is observed through the real scheduler",
+    "P1-G2": "Batched outputs match isolated outputs within declared tolerance",
+    "P1-G3": "No cache, visual, sampler, or output cross-request contamination",
+    "P1-G4": "Page lifecycle releases and safely reuses storage",
+    "P1-G5": "GQA, causal, variable-length, and page-boundary cases pass",
+    "P1-G6": "CUDA-graph parity passes or eager-only scope is documented",
+}
+PR1_TEST_PATHS = [
+    "test/integration/test_qwenvl_attention_parity.py",
+    "test/integration/test_qwenvl_batched_engine.py",
+    "test/integration/test_qwenvl_scheduler_batching.py",
+    "test/integration/test_qwenvl_lifecycle.py",
+    "test/modular/qwenvl/test_continuous_batch_serving.py",
+]
+# Parametrised test ids carry the harness target; only the CUDA FlashInfer
+# rows count as Integration evidence. CPU rows are a harness dry run.
+CUDA_TARGET_ID = "cuda-flashinfer-bf16"
+CPU_TARGET_ID = "cpu-dense-fp32"
 
 
 def _write_evidence(payload: dict[str, Any], output: Path | None) -> None:
@@ -204,9 +235,162 @@ def server_evidence(args: argparse.Namespace) -> None:
     )
 
 
+class _GateRecorder:
+    """pytest plugin: map every executed test to its PR1 gates and outcome."""
+
+    def __init__(self) -> None:
+        self.gates_by_nodeid: dict[str, list[str]] = {}
+        self.target_by_nodeid: dict[str, tuple[str, str]] = {}
+        self.results: dict[str, dict[str, Any]] = {}
+
+    def pytest_collection_modifyitems(self, session, config, items) -> None:
+        for item in items:
+            gates = sorted({mark.args[0] for mark in item.iter_markers("p1_gate") if mark.args})
+            if not gates:
+                continue
+            self.gates_by_nodeid[item.nodeid] = gates
+            integration = "test/integration/" in item.nodeid.replace("\\", "/")
+            if CPU_TARGET_ID in item.nodeid:
+                self.target_by_nodeid[item.nodeid] = (
+                    "cpu",
+                    "Component (harness dry run on CPU dense reference; not acceptance)",
+                )
+            elif integration and (CUDA_TARGET_ID in item.nodeid or item.get_closest_marker("cuda") is not None):
+                self.target_by_nodeid[item.nodeid] = ("cuda", "Integration")
+            else:
+                self.target_by_nodeid[item.nodeid] = ("component", "Component")
+
+    def pytest_runtest_logreport(self, report) -> None:
+        if report.nodeid not in self.gates_by_nodeid:
+            return
+        # A failed/skipped setup is the test's outcome; otherwise use the call phase.
+        if report.when == "setup" and report.outcome == "passed":
+            return
+        if report.when == "teardown":
+            return
+        if report.nodeid in self.results and report.when == "call" and self.results[report.nodeid]["phase"] == "setup":
+            return
+        entry: dict[str, Any] = {
+            "outcome": report.outcome,
+            "phase": report.when,
+            "duration_s": round(report.duration, 3),
+        }
+        if report.outcome == "skipped" and report.longrepr is not None:
+            entry["reason"] = str(report.longrepr[-1] if isinstance(report.longrepr, tuple) else report.longrepr)
+        if report.outcome == "failed":
+            entry["longrepr"] = str(report.longrepr)[-4000:]
+        self.results[report.nodeid] = entry
+
+
+def batch_evidence(args: argparse.Namespace) -> None:
+    import pytest
+    import torch
+
+    cuda = torch.cuda.is_available()
+    if not cuda and not args.allow_cpu_only:
+        raise RuntimeError(
+            "PR-1 batch acceptance requires a CUDA GPU with FlashInfer. "
+            "Pass --allow-cpu-only to record a CPU dry run (not acceptance evidence)."
+        )
+    try:
+        import flashinfer  # type: ignore
+
+        flashinfer_version = getattr(flashinfer, "__version__", "unknown")
+    except ImportError:
+        flashinfer_version = None
+
+    recorder = _GateRecorder()
+    pytest_args = [str(REPO_ROOT / path) for path in PR1_TEST_PATHS]
+    pytest_args += ["-q", "-p", "no:cacheprovider", "-W", "ignore", "--rootdir", str(REPO_ROOT)]
+    if args.skip_cpu_rows:
+        pytest_args += ["-k", f"not {CPU_TARGET_ID}"]
+    if args.pytest_args:
+        pytest_args += args.pytest_args
+    exit_code = int(pytest.main(pytest_args, plugins=[recorder]))
+
+    tests: list[dict[str, Any]] = []
+    for nodeid, gates in sorted(recorder.gates_by_nodeid.items()):
+        result = recorder.results.get(nodeid, {"outcome": "not run", "phase": None})
+        target, label = recorder.target_by_nodeid[nodeid]
+        tests.append({"nodeid": nodeid, "gates": gates, "target": target, "evidence_label": label, **result})
+
+    gate_report: dict[str, dict[str, Any]] = {}
+    for gate, description in PR1_GATES.items():
+        rows = [t for t in tests if gate in t["gates"]]
+        if gate == "P1-G6":
+            # Eager-only decision: proven by the component test that pins
+            # ``get_cuda_graph_configs() == []`` plus the design doc.
+            label = "Component + design doc (eager-only scope, option A)"
+            acceptance_rows = [t for t in rows if t["target"] == "component"]
+        else:
+            label = "Integration"
+            acceptance_rows = [t for t in rows if t["target"] == "cuda"]
+        passed = [t for t in acceptance_rows if t["outcome"] == "passed"]
+        failed = [t for t in rows if t["outcome"] == "failed"]
+        skipped = [t for t in acceptance_rows if t["outcome"] != "passed"]
+        if failed:
+            verdict = "fail"
+        elif not acceptance_rows:
+            verdict = "no acceptance tests"
+        elif passed and not skipped:
+            verdict = "pass"
+        elif passed:
+            verdict = "partial (some acceptance rows skipped)"
+        else:
+            verdict = "not collected (CUDA/FlashInfer rows skipped)"
+        gate_report[gate] = {
+            "description": description,
+            "evidence_label": label,
+            "verdict": verdict,
+            "acceptance_tests": len(acceptance_rows),
+            "passed": len(passed),
+            "failed": len(failed),
+            "skipped": len(skipped),
+            "dry_run_rows_passed": sum(1 for t in rows if t["target"] == "cpu" and t["outcome"] == "passed"),
+        }
+
+    payload = {
+        "gates": gate_report,
+        "all_gates_pass": all(g["verdict"] == "pass" for g in gate_report.values()),
+        "pytest_exit_code": exit_code,
+        "environment": {
+            "python": platform.python_version(),
+            "torch": torch.__version__,
+            "cuda_available": cuda,
+            "device": torch.cuda.get_device_name(0) if cuda else None,
+            "flashinfer": flashinfer_version,
+            "platform": platform.platform(),
+        },
+        "tolerance": {
+            "bf16_flashinfer": {
+                "rtol": 1e-2,
+                "atol": 2e-2,
+                "note": "last-token logits; greedy streams may only diverge on close-call top-2 margins",
+            },
+            "fp32_dense_reference": {"rtol": 1e-5, "atol": 1e-5},
+        },
+        "cuda_graphs": "eager-only (P1-G6 option A); QwenVLLLMSubmodule.get_cuda_graph_configs() == []",
+        "tests": tests,
+    }
+    _write_evidence(payload, args.output)
+    if not payload["all_gates_pass"] and not args.allow_cpu_only:
+        sys.exit(1)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    batch = subparsers.add_parser("batch", help="Run the PR1 integration suites and emit per-gate P1-G* evidence")
+    batch.add_argument("--output", type=Path)
+    batch.add_argument(
+        "--allow-cpu-only",
+        action="store_true",
+        help="Do not require CUDA; records a CPU dense-reference dry run that is NOT acceptance evidence",
+    )
+    batch.add_argument("--skip-cpu-rows", action="store_true", help="Deselect the CPU dry-run parametrisations")
+    batch.add_argument("pytest_args", nargs="*", help="Extra arguments forwarded to pytest (after --)")
+    batch.set_defaults(run=batch_evidence)
 
     checkpoint = subparsers.add_parser("checkpoint", help="Validate real config/load and record peak memory")
     checkpoint.add_argument("--model", default=DEFAULT_MODEL)

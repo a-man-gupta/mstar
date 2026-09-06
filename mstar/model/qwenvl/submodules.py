@@ -72,6 +72,41 @@ def _last_token_indices(seq_lens: list[int], device: torch.device) -> torch.Tens
     return torch.tensor(seq_lens, device=device, dtype=torch.long).cumsum(0) - 1
 
 
+# The only graph walk on which the LLM node may receive vision tensors. Text
+# ``prefill`` and ``decode`` requests must never carry visual state into a
+# batch: same-walk batching (PR1 boundary) relies on every request in a
+# launch sharing one embedding/DeepStack code path.
+VISION_WALK = "prefill_vision"
+_VISION_TENSOR_KEYS = ("vision_embeds", "deepstack_visual_embeds")
+
+
+def _has_vision_inputs(request: NodeInputs) -> bool:
+    return any(request.tensor_inputs.get(key) is not None for key in _VISION_TENSOR_KEYS)
+
+
+def qwenvl_batch_is_homogeneous(graph_walk: str, inputs: list[NodeInputs]) -> bool:
+    """PR1 same-walk batching contract for the QwenVL LLM node.
+
+    * ``prefill``: every request is text-only (no vision tensors).
+    * ``prefill_vision``: every request carries vision + DeepStack tensors.
+    * ``decode``: every request is a single-token step with no vision tensors.
+
+    The scheduler already groups by ``(node, graph_walk)``; this check keeps a
+    mislabelled or partially-populated request from silently sharing a packed
+    launch with requests on a different embedding path.
+    """
+    if not inputs:
+        return False
+    with_vision = [_has_vision_inputs(request) for request in inputs]
+    if graph_walk == VISION_WALK:
+        return all(with_vision)
+    if any(with_vision):
+        return False
+    if graph_walk == "decode":
+        return all(getattr(request, "input_seq_len", 1) == 1 for request in inputs)
+    return graph_walk == "prefill"
+
+
 class QwenVLVisionSubmodule(NodeSubmodule):
     """HF's checkpoint-compatible Qwen vision tower as a stateless node."""
 
@@ -207,12 +242,21 @@ class QwenVLLLMSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
+        if not qwenvl_batch_is_homogeneous(graph_walk, inputs):
+            raise ValueError(
+                f"QwenVL LLM received a non-homogeneous {graph_walk!r} batch: vision tensors are "
+                f"only allowed (and then required) on the {VISION_WALK!r} walk, and decode steps "
+                "must be single-token. Requests with vision: "
+                f"{[_has_vision_inputs(request) for request in inputs]}."
+            )
         cache = getattr(engine_inputs, "cache_manager", None)
         seq_lens = [request.input_seq_len for request in inputs]
         position_ids = torch.cat([request.custom_pos_ids for request in inputs], dim=1)
         position_advance = [int(request.kwargs["position_advance"]) for request in inputs]
         # Compatibility path for component tests that still inject a fake
         # cache_manager. Production planning lives on declare_step.
+        # Keep the MRoPE span on that side channel so advance_seq_lens()
+        # moves each request by its 3D-position span (P1-G6 is eager-only).
         if cache is not None:
             cache.set_active_label("main")
             cache.plan_attention(seq_lens=seq_lens, is_causal=True, label="main")
@@ -225,21 +269,25 @@ class QwenVLLLMSubmodule(ARNodeSubmodule):
             "position_advance": position_advance,
             "seq_lens": seq_lens,
         }
-        vision = [request.tensor_inputs.get("vision_embeds") for request in inputs]
-        if any(item is not None for item in vision):
-            packed["vision_embeds"] = torch.cat([item for item in vision if item is not None], dim=0)
-            packed["visual_token_mask"] = packed["text_inputs"] == self.config.image_token_id
+        if graph_walk == VISION_WALK:
+            vision = [request.tensor_inputs.get("vision_embeds") for request in inputs]
             deepstack = [request.tensor_inputs.get("deepstack_visual_embeds") for request in inputs]
+            if any(item is None for item in vision) or any(item is None for item in deepstack):
+                raise ValueError(
+                    f"Every QwenVL {VISION_WALK!r} request must carry both 'vision_embeds' and "
+                    "'deepstack_visual_embeds'."
+                )
+            packed["vision_embeds"] = torch.cat(vision, dim=0)
+            packed["visual_token_mask"] = packed["text_inputs"] == self.config.image_token_id
             expected_layers = len(self.config.vision_config.deepstack_visual_indexes)
             for item in deepstack:
-                if item is not None and len(item) != expected_layers:
+                if len(item) != expected_layers:
                     raise ValueError(
                         "QwenVL vision request has the wrong number of DeepStack feature sets; "
                         f"got {len(item)}, expected {expected_layers}."
                     )
             packed["deepstack_visual_embeds"] = [
-                torch.cat([item[layer] for item in deepstack if item is not None], dim=0)
-                for layer in range(expected_layers)
+                torch.cat([item[layer] for item in deepstack], dim=0) for layer in range(expected_layers)
             ]
         cos, sin = compute_mrope_cos_sin(
             position_ids,
@@ -268,6 +316,7 @@ class QwenVLLLMSubmodule(ARNodeSubmodule):
 
     def _hidden_states(
         self,
+        graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         text_inputs: torch.Tensor,
         position_ids: torch.Tensor,
@@ -278,6 +327,13 @@ class QwenVLLLMSubmodule(ARNodeSubmodule):
         visual_token_mask: torch.Tensor | None = None,
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        if graph_walk != VISION_WALK and (
+            vision_embeds is not None or visual_token_mask is not None or deepstack_visual_embeds is not None
+        ):
+            # Visual state is owned by the prefill_vision step of the request
+            # that produced it. Decode (and text prefill) must never re-inject
+            # it, or one request's image would bleed into a shared launch.
+            raise ValueError(f"QwenVL {graph_walk!r} forward must not receive vision or DeepStack tensors.")
         embeddings = self._merge_embeddings(text_inputs, vision_embeds)
         cache = getattr(engine_inputs, "cache_manager", None)
         return self.language_model(
@@ -307,6 +363,7 @@ class QwenVLLLMSubmodule(ARNodeSubmodule):
         **kwargs,
     ) -> NameToTensorList:
         hidden = self._hidden_states(
+            graph_walk,
             engine_inputs,
             text_inputs,
             position_ids,
@@ -323,9 +380,35 @@ class QwenVLLLMSubmodule(ARNodeSubmodule):
             last = hidden.index_select(0, _last_token_indices(seq_lens, hidden.device))
         return {"logits": [self.lm_head(last)]}
 
+    def get_needed_cache_labels(
+        self,
+        graph_walk: str,
+        per_request_info: dict[str, CurrentForwardPassInfo],
+    ) -> list[str]:
+        """QwenVL keeps a single ``main`` KV label on every walk; the vision
+        encoder is stateless, so there is nothing else to transfer."""
+        return ["main"]
+
+    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list:
+        """PR1 scope is eager-only (P1-G6 option A).
+
+        ``forward``/``forward_batched`` still contain host syncs and
+        data-dependent shapes (``int(image_mask.sum())``, the embedding
+        ``clone`` + masked scatter, DeepStack injection), so no walk opts into
+        CUDA-graph capture. Enabling capture is a follow-on that must come with
+        eager-vs-replay parity evidence; see
+        ``docs/qwenvl/PR_1_CONTINUOUS_BATCHING.md``.
+        """
+        return []
+
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
-        del batch, model_inputs
-        return True
+        """Batch only same-walk, same-embedding-path requests (PR1 boundary).
+
+        A heterogeneous group never reaches a packed launch that mixes text
+        and vision paths; ``preprocess`` then rejects a mislabelled request
+        loudly instead of silently packing it.
+        """
+        return qwenvl_batch_is_homogeneous(batch.graph_walk, model_inputs)
 
     def forward_batched(
         self,
@@ -343,6 +426,7 @@ class QwenVLLLMSubmodule(ARNodeSubmodule):
         **kwargs,
     ) -> dict[str, NameToTensorList]:
         hidden = self._hidden_states(
+            graph_walk,
             engine_inputs,
             text_inputs,
             position_ids,

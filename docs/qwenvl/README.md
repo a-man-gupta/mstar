@@ -1,6 +1,6 @@
-# QwenVL PR 0 design
+# QwenVL design record
 
-This directory is the design record for the first QwenVL integration slice for
+This directory is the design record for the QwenVL integration stack for
 MStar issue [#127](https://github.com/mstar-project/mstar/issues/127).
 
 The stack begins with a single-GPU, non-tensor-parallel correctness baseline
@@ -12,7 +12,7 @@ own runtime acceptance gates pass.
 | Document | Scope | Merge claim allowed |
 | --- | --- | --- |
 | [Single-GPU correctness](PR_0_SINGLE_GPU_CORRECTNESS.md) | Official config/checkpoint mapping, image/text graph, MRoPE, bounded KV residency, and greedy decode | Local non-TP baseline only |
-| [Continuous batching](PR_1_CONTINUOUS_BATCHING.md) | Scheduler-level batching, paged-attention ownership, and isolation gates | Design only; CUDA integration evidence required |
+| [Continuous batching](PR_1_CONTINUOUS_BATCHING.md) | Same-walk batching guards, paged-attention ownership, isolation/lifecycle gates, engine + worker integration harness, eager-only CUDA-graph scope | Continuous batching + paged attention on one GPU, once `benchmark/qwenvl_acceptance.py batch` reports every P1 gate `pass` on a CUDA + FlashInfer host |
 
 ## Evidence labels
 
@@ -24,3 +24,23 @@ own runtime acceptance gates pass.
 PR 0 has unit/component evidence only until its real-checkpoint CUDA protocol
 passes. “Tests pass” without its environment and evidence label is not an
 acceptance claim.
+
+## Where the tests live
+
+| Location | Label | Notes |
+| --- | --- | --- |
+| `test/modular/qwenvl/` | Component | fake `Cache`, direct `preprocess`/`forward_batched`; pins the P1-G6 eager-only decision |
+| `test/integration/test_qwenvl_attention_parity.py` | Integration (`cuda-flashinfer-bf16` rows) | P1-G5: FlashInfer vs dense SDPA reference through `KVCacheEngine` |
+| `test/integration/test_qwenvl_batched_engine.py` | Integration | P1-G2: `_execute_batched` vs `_execute_sequential`, B∈{2,4,8} |
+| `test/integration/test_qwenvl_scheduler_batching.py` | Integration | P1-G1: batch shapes observed at `MicroScheduler` and engine entry |
+| `test/integration/test_qwenvl_lifecycle.py` | Integration | P1-G3/G4: perturbation isolation, completion, cancel, page reuse, OOM hold |
+
+Each integration test is also parametrised with a `cpu-dense-fp32` row. That
+row runs on a laptop and validates the harness and engine plumbing; it carries
+the Component label and is never acceptance evidence.
+
+```bash
+uv run --extra qwenvl --extra dev pytest -q test/modular/qwenvl test/integration/test_qwenvl_*.py   # CPU dry run
+uv run --extra qwenvl --extra dev pytest -q test/integration/test_qwenvl_*.py -m cuda                  # PR1 acceptance
+uv run --extra qwenvl --extra dev python benchmark/qwenvl_acceptance.py batch --skip-cpu-rows --output qwenvl-batch-evidence.json
+```

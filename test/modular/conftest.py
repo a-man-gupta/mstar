@@ -45,3 +45,13 @@ if "triton" not in sys.modules:
     triton.heuristics = lambda *a, **k: (lambda f: f)
     sys.modules["triton"] = triton
     sys.modules["triton.language"] = triton.language
+
+
+def pytest_configure(config):
+    # Shared with test/integration: lets QwenVL component tests that pin a
+    # PR1 gate decision (e.g. the eager-only P1-G6 scope) be collected by
+    # ``benchmark/qwenvl_acceptance.py batch``.
+    config.addinivalue_line(
+        "markers",
+        "p1_gate(name): QwenVL PR1 acceptance gate this test provides evidence for (P1-G1 .. P1-G6)",
+    )
