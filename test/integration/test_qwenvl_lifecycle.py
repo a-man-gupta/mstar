@@ -302,8 +302,14 @@ def test_worker_completion_by_eos_stops_the_decode_loop_early(target) -> None:
         worker.llm_submodule.lm_head.weight[eos] += 50.0
     worker.run_until_done()
     stops, runs = worker.records["stops"], worker.records["runs"]
-    assert stops.tokens[:2] == [eos, eos] and len(stops.tokens) == 2, stops.tokens
-    assert runs.tokens == [eos] * (MAX_OUTPUT_TOKENS + 1), runs.tokens
+    assert stops.tokens[:2] == [eos, eos] and len(stops.tokens) == 2, {
+        "tokens": stops.tokens,
+        "top2": stops.top2,
+    }
+    assert runs.tokens == [eos] * (MAX_OUTPUT_TOKENS + 1), {
+        "tokens": runs.tokens,
+        "top2": runs.top2,
+    }
     assert worker.free_pages == worker.total_pages
 
 

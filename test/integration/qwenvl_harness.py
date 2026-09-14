@@ -830,9 +830,18 @@ def assert_logits_close(actual: torch.Tensor, expected: torch.Tensor, target: Ta
     diff = (actual - expected).abs()
     scale = expected.abs().max().clamp_min(1e-6)
     rel = float(diff.max() / scale)
+    max_index = int(diff.argmax())
+    actual_values, actual_indices = torch.topk(actual, 2)
+    expected_values, expected_indices = torch.topk(expected, 2)
+    actual_margin = float(actual_values[0] - actual_values[1])
+    expected_margin = float(expected_values[0] - expected_values[1])
     assert torch.allclose(actual, expected, rtol=rtol, atol=atol), (
         f"{what}: logits mismatch (max abs diff {float(diff.max()):.3e}, max rel-to-scale {rel:.3e}, "
-        f"tolerance rtol={rtol}, atol={atol})\nactual={actual.tolist()}\nexpected={expected.tolist()}"
+        f"tolerance rtol={rtol}, atol={atol}, max-diff token={max_index}, "
+        f"actual argmax={int(actual_indices[0])}, expected argmax={int(expected_indices[0])}, "
+        f"argmax_matches={bool(actual_indices[0] == expected_indices[0])}, "
+        f"actual top2={actual_indices.tolist()}/{actual_values.tolist()} margin={actual_margin:.3e}, "
+        f"expected top2={expected_indices.tolist()}/{expected_values.tolist()} margin={expected_margin:.3e})"
     )
 
 

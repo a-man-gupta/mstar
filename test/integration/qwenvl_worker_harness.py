@@ -199,6 +199,7 @@ class RequestRecord:
     prompt: H.TextPrompt | H.VisionPrompt
     tokens: list[int] = field(default_factory=list)
     margins: list[float] = field(default_factory=list)
+    top2: list[tuple[list[int], list[float]]] = field(default_factory=list)
     done: bool = False
     # (node, graph_walk) for every batch this request took part in.
     walks: list[tuple[str, str]] = field(default_factory=list)
@@ -465,6 +466,8 @@ class QwenVLWorker:
             )
             for rid, row in zip(node_batch.request_ids, logits, strict=True):
                 self.records[rid].margins.append(H.top2_margin(row))
+                values, indices = torch.topk(row.float(), 2)
+                self.records[rid].top2.append((indices.tolist(), values.tolist()))
         self._postprocess(batch, node_batch, output)
         return batch
 

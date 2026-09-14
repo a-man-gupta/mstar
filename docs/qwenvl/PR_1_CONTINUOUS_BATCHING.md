@@ -169,6 +169,10 @@ Tolerance: fp32 rows must match to `rtol=atol=1e-5`; bf16 FlashInfer rows use
 `rtol=1e-2, atol=2e-2` on last-token logits (Qwen3-Omni CUDA-graph precedent),
 and a greedy stream may diverge only at a step whose reference top-2 margin is
 within that noise band. Sampling is greedy throughout the parity tests.
+On a CUDA mismatch, the assertion records the max-difference vocabulary index,
+both argmax values, both top-two values/margins, and whether argmax agrees;
+worker EOS diagnostics retain the same top-two evidence per emitted row. This
+data is required before changing the bf16 tolerance.
 
 ### FlashInfer CUDA test geometry
 
