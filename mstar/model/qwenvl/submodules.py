@@ -377,7 +377,8 @@ class QwenVLLLMSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs or request_info.graph_walk != "decode":
             return set()
         token = outputs["new_token"][0].item()
-        sampling_config = request_info.sampling_config["LLM"]
-        reached_eos = not sampling_config.ignore_eos and token == self.config.text_config.eos_token_id
+        sampling_config = request_info.resource_configs.get(SAMPLER)
+        ignore_eos = False if sampling_config is None else sampling_config.ignore_eos
+        reached_eos = not ignore_eos and token == self.config.text_config.eos_token_id
         reached_limit = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1 >= request_info.max_tokens
         return {"decode_loop"} if reached_eos or reached_limit else set()

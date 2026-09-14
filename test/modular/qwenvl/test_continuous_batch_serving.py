@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.engine.resources import SamplingReqConfig
 from mstar.model.qwenvl.components import QwenVLForCausalLM
 from mstar.model.qwenvl.submodules import (
     QwenVLLLMSubmodule,
@@ -171,7 +172,7 @@ def test_decode_serving_honors_per_request_last_token_and_stop_conditions():
     )["logits"][0].shape == (1, config.text_config.vocab_size)
     request = SimpleNamespace(
         graph_walk="decode",
-        sampling_config={"LLM": SimpleNamespace(ignore_eos=False)},
+        resource_configs={"sampler": SamplingReqConfig(ignore_eos=False)},
         dynamic_loop_iter_counts={"decode_loop": 0},
         max_tokens=3,
     )
