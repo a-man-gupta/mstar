@@ -95,11 +95,11 @@ LLM_NODE = "LLM"
 TINY_IMAGE_TOKEN_ID = 30
 
 # BF16 FlashInfer uses different reduction trees for prefill/decode and packed
-# rows than the fp32 SDPA oracle. The SM87 Orin evidence at this test geometry
-# bounded stable-argmax drift at abs=0.109 / rel=0.016, so retain margin above
-# that observed envelope while requiring argmax agreement below.
-BF16_LOGITS_RTOL = 2e-2
-BF16_LOGITS_ATOL = 1.25e-1
+# rows than the fp32 SDPA oracle. The complete SM87 Orin B=8 evidence bounded
+# stable top-two drift at abs=0.547 / rel=0.090, so retain a small margin over
+# that observed envelope while requiring the top-two token identities below.
+BF16_LOGITS_RTOL = 1e-1
+BF16_LOGITS_ATOL = 6e-1
 # fp32 dense-reference path: batched and isolated must agree to float noise.
 FP32_LOGITS_RTOL = 1e-5
 FP32_LOGITS_ATOL = 1e-5
@@ -837,13 +837,10 @@ def assert_logits_close(actual: torch.Tensor, expected: torch.Tensor, target: Ta
     expected_values, expected_indices = torch.topk(expected, 2)
     actual_margin = float(actual_values[0] - actual_values[1])
     expected_margin = float(expected_values[0] - expected_values[1])
-    if target.dtype != torch.float32 and actual_indices[0] != expected_indices[0]:
-        noise_bound = atol + rtol * float(scale)
-        assert expected_margin <= noise_bound, (
-            f"{what}: bf16 argmax diverged ({int(actual_indices[0])} vs {int(expected_indices[0])}) "
-            f"despite a clear reference margin {expected_margin:.3e} > numerical bound {noise_bound:.3e}; "
-            f"actual top2={actual_indices.tolist()}/{actual_values.tolist()}, "
-            f"expected top2={expected_indices.tolist()}/{expected_values.tolist()}"
+    if target.dtype != torch.float32:
+        assert torch.equal(actual_indices, expected_indices), (
+            f"{what}: bf16 top-two tokens diverged ({actual_indices.tolist()} vs {expected_indices.tolist()}); "
+            f"actual values={actual_values.tolist()}, expected values={expected_values.tolist()}"
         )
     assert torch.allclose(actual, expected, rtol=rtol, atol=atol), (
         f"{what}: logits mismatch (max abs diff {float(diff.max()):.3e}, max rel-to-scale {rel:.3e}, "

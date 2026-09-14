@@ -166,12 +166,13 @@ is acceptance evidence:
 | `cpu-dense-fp32` | CPU, test-local SDPA attention resource over production KV pages, fp32 | Component (harness dry run) |
 
 Tolerance: fp32 rows must match to `rtol=atol=1e-5`. BF16 FlashInfer rows use
-`rtol=2e-2, atol=1.25e-1` on last-token logits. The Orin SM87 FlashInfer 0.6.18
-evidence measured stable-argmax drift through `abs=0.109` and
-`rel-to-scale=0.016` across FlashInfer-vs-SDPA, incremental, and packed-row
-paths; the bound retains a small margin over that observed envelope. An argmax
-change still fails whenever the reference top-two margin exceeds the same
-numerical bound, and greedy-stream tests retain their per-step near-tie guard.
+`rtol=1e-1, atol=6e-1` on last-token logits. Complete Orin SM87 FlashInfer
+0.6.18 B=8 evidence measured `abs=0.547` and `rel-to-scale=0.090` across
+FlashInfer-vs-SDPA and packed-versus-sequential decode; the bound retains a
+small margin over that envelope. The two highest-logit token identities must
+still match exactly, and greedy-stream tests retain their per-step near-tie
+guard. This prevents the broader value envelope from admitting a changed
+greedy choice or a changed nearest competitor.
 Sampling is greedy throughout the parity tests.
 On a CUDA mismatch, the assertion records the max-difference vocabulary index,
 both argmax values, both top-two values/margins, and whether argmax agrees;

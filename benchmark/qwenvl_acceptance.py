@@ -376,7 +376,7 @@ def batch_evidence(args: argparse.Namespace) -> None:
             "bf16_flashinfer": {
                 "rtol": bf16_rtol,
                 "atol": bf16_atol,
-                "note": "last-token logits; a clear-margin argmax divergence fails",
+                "note": "last-token logits; the two highest-logit token identities must match",
             },
             "fp32_dense_reference": {"rtol": fp32_rtol, "atol": fp32_atol},
         },
