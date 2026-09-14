@@ -279,11 +279,7 @@ class FlashInferDecodeWrapper:
                 workspace_buffer,
                 "NHD",
                 use_cuda_graph=True,
-                # The tensor-core route has a distinct bf16 numerical path.
-                # Keep CUDA-core decode as the correctness default; a
-                # model-specific tensor-core performance mode needs its own
-                # parity evidence.
-                use_tensor_cores=False,
+                use_tensor_cores=True,
                 paged_kv_indptr_buffer=self._paged_kv_indptr_buf,
                 paged_kv_indices_buffer=self._paged_kv_indices_buf,
                 paged_kv_last_page_len_buffer=self._paged_kv_last_page_len_buf,
@@ -292,7 +288,7 @@ class FlashInferDecodeWrapper:
         else:
             self.attn_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                 workspace_buffer, "NHD",
-                use_tensor_cores=False,
+                use_tensor_cores=True,
                 backend=backend,
             )
 

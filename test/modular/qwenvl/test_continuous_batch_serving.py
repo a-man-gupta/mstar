@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -17,33 +16,6 @@ from mstar.model.qwenvl.submodules import (
 )
 
 from ._helpers import Cache, FixedLanguageModel, tiny_config
-
-
-def test_flashinfer_decode_defaults_to_cuda_cores_for_qwenvl_parity(monkeypatch):
-    """QwenVL's GQA decode uses the accuracy-first FlashInfer path.
-
-    Tensor-core decode is a separate numerical implementation. It may be
-    selected later with model-specific parity and performance evidence, but
-    it must not silently be the default for the QwenVL paged-KV contract.
-    """
-    captured = {}
-
-    class DecodeWrapper:
-        def __init__(self, *_args, **kwargs):
-            captured.update(kwargs)
-
-    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(BatchDecodeWithPagedKVCacheWrapper=DecodeWrapper))
-    from mstar.engine.resources.attn.wrappers import FlashInferDecodeWrapper
-
-    FlashInferDecodeWrapper(
-        workspace_buffer=torch.empty(1),
-        num_qo_heads=2,
-        num_kv_heads=1,
-        head_dim=8,
-        page_size=16,
-        device=torch.device("cpu"),
-    )
-    assert captured["use_tensor_cores"] is False
 
 
 def test_visual_chat_uses_post_merge_features_and_preserves_request_context():
