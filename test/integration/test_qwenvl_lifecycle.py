@@ -297,10 +297,21 @@ def test_worker_completion_by_eos_stops_the_decode_loop_early(target) -> None:
     honor_eos = H.greedy_sampling(worker.config, ignore_eos=False)
     worker.submit("stops", H.text_prompt(12, seed=1), sampling=honor_eos)
     worker.submit("runs", H.text_prompt(12, seed=1))  # same prompt, ignore_eos=True
-    # Bias the head so both requests emit EOS from the first token on.
-    with torch.no_grad():
-        worker.llm_submodule.lm_head.weight[eos] += 50.0
-    worker.run_until_done()
+
+    # Adding a uniform constant to a projection row does *not* guarantee its
+    # logit rises: the dot product scales with sum(hidden_state), which may be
+    # negative. Force the emitted EOS logit at the module-output seam instead,
+    # leaving the production sampler and decode-stop path under test.
+    def force_eos_logit(_module, _inputs, logits):
+        forced = logits.clone()
+        forced[:, eos] = forced.max(dim=-1).values + 100.0
+        return forced
+
+    hook = worker.llm_submodule.lm_head.register_forward_hook(force_eos_logit)
+    try:
+        worker.run_until_done()
+    finally:
+        hook.remove()
     stops, runs = worker.records["stops"], worker.records["runs"]
     assert stops.tokens[:2] == [eos, eos] and len(stops.tokens) == 2, {
         "tokens": stops.tokens,

@@ -308,6 +308,17 @@ def batch_evidence(args: argparse.Namespace) -> None:
         pytest_args += args.pytest_args
     exit_code = int(pytest.main(pytest_args, plugins=[recorder]))
 
+    # The harness owns the numerical contract. It is loaded as part of the
+    # suite (after pytest's integration conftest has set up its CPU stubs), so
+    # read its values instead of duplicating them in this evidence report.
+    harness = sys.modules.get("qwenvl_harness")
+    if harness is None:
+        raise RuntimeError("PR-1 acceptance harness did not load; cannot report its tolerance.")
+    bf16_rtol = harness.BF16_LOGITS_RTOL
+    bf16_atol = harness.BF16_LOGITS_ATOL
+    fp32_rtol = harness.FP32_LOGITS_RTOL
+    fp32_atol = harness.FP32_LOGITS_ATOL
+
     tests: list[dict[str, Any]] = []
     for nodeid, gates in sorted(recorder.gates_by_nodeid.items()):
         result = recorder.results.get(nodeid, {"outcome": "not run", "phase": None})
@@ -363,11 +374,11 @@ def batch_evidence(args: argparse.Namespace) -> None:
         },
         "tolerance": {
             "bf16_flashinfer": {
-                "rtol": 1e-2,
-                "atol": 2e-2,
-                "note": "last-token logits; greedy streams may only diverge on close-call top-2 margins",
+                "rtol": bf16_rtol,
+                "atol": bf16_atol,
+                "note": "last-token logits; a clear-margin argmax divergence fails",
             },
-            "fp32_dense_reference": {"rtol": 1e-5, "atol": 1e-5},
+            "fp32_dense_reference": {"rtol": fp32_rtol, "atol": fp32_atol},
         },
         "cuda_graphs": "eager-only (P1-G6 option A); QwenVLLLMSubmodule.get_cuda_graph_configs() == []",
         "tests": tests,
