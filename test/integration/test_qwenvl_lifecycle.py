@@ -294,7 +294,7 @@ def test_worker_completion_by_token_limit_frees_pages_and_state(target) -> None:
 def test_worker_completion_by_eos_stops_the_decode_loop_early(target) -> None:
     worker = W.QwenVLWorker(target, seed=0, max_output_tokens=MAX_OUTPUT_TOKENS, page_size=16, max_num_pages=64)
     eos = worker.config.text_config.eos_token_id
-    honor_eos = worker.model.resolve_sampling_configs(H.LLM_NODE, {"ignore_eos": False})
+    honor_eos = H.greedy_sampling(worker.config, ignore_eos=False)
     worker.submit("stops", H.text_prompt(12, seed=1), sampling=honor_eos)
     worker.submit("runs", H.text_prompt(12, seed=1))  # same prompt, ignore_eos=True
     # Bias the head so both requests emit EOS from the first token on.

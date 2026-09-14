@@ -61,16 +61,29 @@ tiny_config = _modular_helpers.tiny_config
 from mstar.communication.tensors import LocalTransferEngine  # noqa: E402
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.distributed.communication import WorkerParallelGroups  # noqa: E402
-from mstar.engine import kv_store as kv_store_module  # noqa: E402
-from mstar.engine.base import NodeBatch, NodeOutput  # noqa: E402
-from mstar.engine.cache_manager import ATTENTION_BACKENDS, BatchedCacheManager, _PlanState  # noqa: E402
-from mstar.engine.kv_cache_engine import KVCacheEngine  # noqa: E402
-from mstar.engine.kv_store import KVCacheConfig, KVTransferEngine, TransferEngineInfo  # noqa: E402
+from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
+from mstar.engine.resources import (  # noqa: E402
+    AttentionConfig,
+    AttentionSpec,
+    KVConfig,
+    KVSpec,
+    NodeResourceSpec,
+    PositionConfig,
+    PositionSpec,
+    SamplerSpec,
+    SamplingReqConfig,
+    StepContext,
+)
+from mstar.engine.resources.attn.base import AttentionManager  # noqa: E402
+from mstar.engine.resources.base import EngineResourceInfo  # noqa: E402
+from mstar.engine.resources.kv import manager as kv_manager_module  # noqa: E402
+from mstar.engine.resources.kv.plan import KVPlanOutputs  # noqa: E402
+from mstar.engine.resources.kv.transfer import TransferEngineInfo  # noqa: E402
+from mstar.engine.resources.sampler import utils as sampling_module  # noqa: E402
 from mstar.model.components import norm as norm_module  # noqa: E402
 from mstar.model.qwenvl.components import QwenVLForCausalLM  # noqa: E402
+from mstar.model.qwenvl.config import ATTN, KV_CACHE, POS, SAMPLER  # noqa: E402
 from mstar.model.qwenvl.submodules import QwenVLLLMSubmodule, qwen_vl_position_ids  # noqa: E402
-from mstar.utils import sampling as sampling_module  # noqa: E402
-from mstar.utils.sampling import MultiSamplingConfig, SamplingConfig  # noqa: E402
 
 DENSE_REFERENCE_BACKEND = "qwenvl_dense_reference"
 FLASHINFER_BACKEND = "flashinfer"
@@ -91,102 +104,70 @@ FP32_LOGITS_ATOL = 1e-5
 
 
 # ---------------------------------------------------------------------------
-# Dense reference attention backend
+# Dense reference attention resource
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class _ReferenceSegment:
-    prior: int
-    new: int
-    pages: list[int]
+class DenseReferenceAttentionManager(AttentionManager):
+    """Resource-pool-native dense SDPA oracle for the FlashInfer path.
 
-
-class DenseReferenceCacheManager(BatchedCacheManager):
-    """Paged KV store + dense fp32 SDPA kernel.
-
-    Shares the page tables (``PagedAllocationManager``), the cache tensor
-    layout, the ``_PlanState`` side-channels (``seq_lens``, ``write_store``,
-    ``custom_pos_advance``) and ``advance_seq_lens`` with the FlashInfer
-    backend, so the engine cannot tell the two apart. Only the attention
-    arithmetic differs: each request's K/V is gathered from its pages into a
-    contiguous ``[total, kv_heads, head_dim]`` sequence, GQA groups are
-    expanded explicitly, and a boolean causal mask is applied in fp32.
+    The production ``KVManager`` owns page allocation and writes. This test
+    resource consumes its plan views and layer page tensor, gathers each
+    request back to a contiguous sequence, expands GQA explicitly, and runs
+    fp32 SDPA. It is deliberately a test-only resource instead of a legacy
+    ``BatchedCacheManager`` compatibility path.
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._segments: dict[str, tuple[list[_ReferenceSegment], bool]] = {}
+    def __init__(self, kv_cache: str):
+        self._kv_cache_name = kv_cache
+        self._plans: KVPlanOutputs | None = None
+        self._causal = True
 
-    def plan_attention(
-        self,
-        seq_lens: list[int] | None = None,
-        dtype: torch.dtype | None = None,
-        is_causal=True,
-        write_store: bool = True,
-        label: str | None = None,
-        **kwargs,
-    ):
-        assert seq_lens is not None and len(seq_lens) == len(self.request_ids)
-        effective_label = label if label is not None else self._active_label()
-        segments: list[_ReferenceSegment] = []
-        for rid, new in zip(self.request_ids, seq_lens, strict=True):
-            state = self._get_state(rid, effective_label)
-            prior = state.seq_len
-            # Same allocation call (and therefore the same AllocationFailedError
-            # surface) as FlashInferCacheManager._plan_attention_impl.
-            self.alloc_manager.alloc(rid, label=effective_label, seq_len=prior + new)
-            segments.append(_ReferenceSegment(prior=prior, new=new, pages=list(state.page_indices)))
-        ps = self._plan_states.get(effective_label)
-        if ps is None:
-            ps = _PlanState()
-            self._plan_states[effective_label] = ps
-        ps.seq_lens = list(seq_lens)
-        ps.write_store = write_store
-        ps.dense_gen = None
-        self._segments[effective_label] = (segments, bool(is_causal))
+    @classmethod
+    def build(cls, spec: "DenseReferenceAttentionSpec", info: EngineResourceInfo):
+        del info
+        return cls(spec.config.kv_cache)
 
-    def plan_attention_batched_cfg(self, *args, **kwargs):
-        raise NotImplementedError("QwenVL has no CFG branches; the dense reference backend does not plan them.")
+    def depends_on(self) -> set[str]:
+        return {self._kv_cache_name}
 
-    def run_attention(
+    def plan(self, step, ctx: StepContext):
+        self.reset_default_cursors()
+        plans = ctx.plan_results.get(self._kv_cache_name)
+        assert plans is not None, f"dense reference expected KV plan {self._kv_cache_name!r}"
+        self._plans = plans
+        self._causal = bool(step.causal)
+
+    def run(
         self,
         q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer_idx: int | None = None,
+        label: str | None = None,
+        kv_cache_layer: torch.Tensor | None = None,
+        **kwargs,
     ) -> torch.Tensor:
-        layer = self.layer_idx if layer_idx is None else layer_idx
-        label = self._active_label()
-        segments, causal = self._segments[label]
-        cache = self.kv_cache[layer]  # [pages, 2, page_size, kv_heads, head_dim]
-        page_size = self.kv_cache_config.page_size
-        device = q.device
-        outputs = []
+        del kwargs
+        assert self._plans is not None and kv_cache_layer is not None
+        label = label or self.default_label
+        plan = self._plans[label]
+        page_size = kv_cache_layer.shape[2]
+        outputs: list[torch.Tensor] = []
         offset = 0
-        for segment in segments:
-            k_new = k[offset : offset + segment.new]
-            v_new = v[offset : offset + segment.new]
-            q_new = q[offset : offset + segment.new]
-            offset += segment.new
-            pages = torch.tensor(segment.pages, dtype=torch.long, device=device)
-
-            new_pos = torch.arange(segment.prior, segment.prior + segment.new, device=device)
-            cache[pages[new_pos // page_size], 0, new_pos % page_size] = k_new.to(cache.dtype)
-            cache[pages[new_pos // page_size], 1, new_pos % page_size] = v_new.to(cache.dtype)
-
-            total = segment.prior + segment.new
-            all_pos = torch.arange(total, device=device)
-            keys = cache[pages[all_pos // page_size], 0, all_pos % page_size]
-            values = cache[pages[all_pos // page_size], 1, all_pos % page_size]
+        for view in plan.views:
+            new = view.to_compute
+            prior = view.length - new
+            q_new = q[offset : offset + new]
+            offset += new
+            all_pos = torch.arange(view.length, device=q.device)
+            pages = torch.tensor(view.page_idxs, dtype=torch.long, device=q.device)
+            keys = kv_cache_layer[pages[all_pos // page_size], 0, all_pos % page_size]
+            values = kv_cache_layer[pages[all_pos // page_size], 1, all_pos % page_size]
             groups = q_new.shape[1] // keys.shape[1]
             keys = keys.repeat_interleave(groups, dim=1)
             values = values.repeat_interleave(groups, dim=1)
-
             mask = None
-            if causal:
-                query_pos = new_pos[:, None]
-                mask = all_pos[None, :] <= query_pos  # [new, total]
+            if self._causal:
+                query_pos = torch.arange(prior, prior + new, device=q.device)[:, None]
+                mask = all_pos[None, :] <= query_pos
             out = F.scaled_dot_product_attention(
                 q_new.float().permute(1, 0, 2),
                 keys.float().permute(1, 0, 2),
@@ -195,17 +176,19 @@ class DenseReferenceCacheManager(BatchedCacheManager):
             )
             outputs.append(out.permute(1, 0, 2).to(q.dtype))
         assert offset == q.shape[0], f"planned {offset} tokens but received {q.shape[0]} queries"
-        if self.auto_write_store and self._plan_states[label].write_store:
-            for rid in self.request_ids:
-                self.alloc_manager.flush_to_store(rid, label=label, layers=layer)
         return torch.cat(outputs, dim=0)
 
 
-def register_dense_reference_backend() -> None:
-    ATTENTION_BACKENDS.setdefault(DENSE_REFERENCE_BACKEND, DenseReferenceCacheManager)
+@dataclass
+class DenseReferenceAttentionSpec(NodeResourceSpec):
+    config: AttentionConfig
 
+    def depends_on(self) -> set[str]:
+        return {self.config.kv_cache}
 
-register_dense_reference_backend()
+    @property
+    def resource_class(self):
+        return DenseReferenceAttentionManager
 
 
 # ---------------------------------------------------------------------------
@@ -213,16 +196,16 @@ register_dense_reference_backend()
 # ---------------------------------------------------------------------------
 
 
-class _NoopKVTransferEngine(KVTransferEngine):
-    """Stands in for ``CudaIpcKVTransferEngine`` on CPU (no CUDA IPC handles)."""
+class _NoopKVTransferManager:
+    """CPU test replacement for the KV resource's CUDA/IPC transport."""
+
+    def __init__(self, *args, **kwargs):
+        del args, kwargs
 
     def get_kv_transfer_info(self):
         return None
 
-    def read_batched_async(self, remote_kv_info, read_info):
-        return None
-
-    def shutdown(self):
+    def cleanup(self):
         return None
 
 
@@ -291,11 +274,7 @@ def install_cpu_shims(monkeypatch: pytest.MonkeyPatch) -> None:
     """Replace the three CUDA-only leaves the engine touches on CPU: the
     CUDA-IPC KV transfer engine, FlashInfer's sampling kernel and
     FlashInfer's RMSNorm kernel."""
-    monkeypatch.setattr(
-        kv_store_module,
-        "CudaIpcKVTransferEngine",
-        lambda kv_cache, max_workers=3: _NoopKVTransferEngine(),
-    )
+    monkeypatch.setattr(kv_manager_module, "KVTransferManager", _NoopKVTransferManager)
     monkeypatch.setattr(sampling_module, "sample_tokens", torch_sample_tokens)
     monkeypatch.setattr(norm_module, "run_rms_norm", torch_rms_norm)
     # FlashInfer's workspace buffer is irrelevant to the dense reference, but
@@ -400,16 +379,14 @@ def build_language_model(config, target: Target, seed: int = 0) -> QwenVLForCaus
     return model.to(device=target.device, dtype=target.dtype).eval()
 
 
-def greedy_sampling(config, ignore_eos: bool = True) -> MultiSamplingConfig:
-    return MultiSamplingConfig(
-        main=SamplingConfig(vocab_size=config.text_config.vocab_size, temperature=0.0, ignore_eos=ignore_eos)
-    )
+def greedy_sampling(config, ignore_eos: bool = True) -> SamplingReqConfig:
+    del config
+    return SamplingReqConfig(temperature=0.0, ignore_eos=ignore_eos)
 
 
-def stochastic_sampling(config, seed: int, temperature: float = 1.0, ignore_eos: bool = True) -> MultiSamplingConfig:
-    sampling = SamplingConfig(vocab_size=config.text_config.vocab_size, temperature=temperature, ignore_eos=ignore_eos)
-    sampling.set_seed(seed)
-    return MultiSamplingConfig(main=sampling)
+def stochastic_sampling(config, seed: int, temperature: float = 1.0, ignore_eos: bool = True) -> SamplingReqConfig:
+    del config
+    return SamplingReqConfig(temperature=temperature, ignore_eos=ignore_eos, _seed=seed)
 
 
 # ---------------------------------------------------------------------------
@@ -419,56 +396,69 @@ def stochastic_sampling(config, seed: int, temperature: float = 1.0, ignore_eos:
 
 @dataclass
 class LLMEngine:
-    """A loaded ``KVCacheEngine`` hosting the tiny QwenVL LLM node."""
+    """A loaded resource-pool ``Engine`` hosting the tiny QwenVL LLM node."""
 
-    engine: KVCacheEngine
+    engine: Engine
     submodule: QwenVLLLMSubmodule
     config: object
     target: Target
-    kv_config: KVCacheConfig
+    kv_config: KVConfig
     node: str = LLM_NODE
     infos: dict[str, CurrentForwardPassInfo] = field(default_factory=dict)
 
     @property
+    def kv(self):
+        return self.engine._resources[KV_CACHE]
+
+    @property
     def alloc_manager(self):
-        return self.engine.submodule_management[self.node].kv_management.alloc_manager
+        """Test-facing view of resource-owned request streams.
+
+        The production cache has no split allocator object after the resource
+        migration. Tests use this only to assert request membership; page
+        ownership stays on ``KVManager``.
+        """
+        from types import SimpleNamespace
+
+        return SimpleNamespace(request_states=self.kv._streams)
 
     @property
     def kv_cache(self) -> torch.Tensor:
-        return self.engine.submodule_management[self.node].kv_management.kv_cache
+        return self.kv.kv_cache.tensor
 
     @property
     def sampler(self):
-        """The node's ``MultiSampler.main`` (per-request config + seen-token state)."""
-        return self.engine.submodule_management[self.node].sampler.main
+        return self.engine._resources[SAMPLER]._sampler
 
     @property
     def free_pages(self) -> int:
-        return self.alloc_manager.num_free_pages
+        return self.kv._arena.num_free
 
     @property
     def total_pages(self) -> int:
-        return self.alloc_manager.total_pages
+        # Resource KV reserves sink page zero for captured padding. The harness
+        # exposes the caller-requested usable capacity, matching its tests.
+        return self.kv.config.max_num_pages - 1
 
     def page_indices(self, rid: str, label: str = "main") -> list[int]:
-        return list(self.alloc_manager.get_state(rid, label).page_indices)
+        return list(self.kv._streams[rid][label].page_indices)
 
     def seq_len(self, rid: str, label: str = "main") -> int:
-        return self.alloc_manager.get_state(rid, label).seq_len
+        return self.kv._streams[rid][label].stored_len
 
     def position_start(self, rid: str, label: str = "main") -> int:
-        return self.alloc_manager.get_state(rid, label).position_id_start
+        return self.engine._resources[POS].position(rid, label)
 
-    def add_request(self, rid: str, sampling: MultiSamplingConfig | None = None, max_tokens: int = 64) -> None:
-        self.engine.add_request(rid)
+    def add_request(self, rid: str, sampling: SamplingReqConfig | None = None, max_tokens: int = 64) -> None:
+        sampling = sampling or greedy_sampling(self.config)
+        self.engine.add_request(rid, {SAMPLER: sampling})
         self.infos[rid] = CurrentForwardPassInfo(
             request_id=rid,
             graph_walk="prefill",
-            requires_cfg=False,
             fwd_index=0,
             random_seed=0,
             max_tokens=max_tokens,
-            sampling_config={self.node: sampling or greedy_sampling(self.config)},
+            resource_configs={SAMPLER: sampling},
         )
 
     def remove_request(self, rid: str) -> None:
@@ -476,19 +466,23 @@ class LLMEngine:
         self.infos.pop(rid, None)
 
     def has_request(self, rid: str) -> bool:
-        return rid in self.alloc_manager.request_states
+        return rid in self.kv._streams
 
-    def batch(self, graph_walk: str, tensors: dict[str, dict[str, list[torch.Tensor]]]) -> NodeBatch:
+    def batch(self, graph_walk: str, tensors: dict[str, dict[str, list[torch.Tensor]]]) -> ExecutingBatch:
         rids = list(tensors)
         per_request_info = {}
         for rid in rids:
             info = self.infos[rid]
             info.graph_walk = graph_walk
             per_request_info[rid] = info
-        return NodeBatch(
+        return ExecutingBatch(
             node_name=self.node,
-            graph_walk=graph_walk,
-            request_ids=rids,
+            step_context=StepContext(
+                request_ids=rids,
+                graph_walk=graph_walk,
+                slot=0,
+                capture=False,
+            ),
             per_request_input_tensors={
                 rid: {name: [t.to(self.target.device) for t in values] for name, values in tensors[rid].items()}
                 for rid in rids
@@ -496,34 +490,44 @@ class LLMEngine:
             per_request_info=per_request_info,
         )
 
-    def run(self, batch: NodeBatch, *, force_sequential: bool = False, allow_alloc_failure: bool = False) -> NodeOutput:
+    def run(self, batch: ExecutingBatch, *, force_sequential: bool = False, allow_alloc_failure: bool = False):
         """Execute through the production entrypoints.
 
-        ``force_sequential`` routes the batch through ``_execute_sequential``
-        (the per-request reference path) by making ``can_batch`` decline;
-        otherwise a homogeneous batch takes ``_execute_batched``.
+        ``force_sequential`` drives the resource engine's per-request fallback
+        by making ``can_batch`` decline; otherwise a homogeneous batch uses one
+        packed ``forward_batched`` launch.
         """
         submodule = self.submodule
         original = submodule.can_batch
         if force_sequential:
             submodule.can_batch = lambda *_args, **_kwargs: False  # type: ignore[method-assign]
         try:
-            output = self.engine.execute_batch(batch)
+            self.engine.prepare_inputs(batch)
+            output = self.engine.exec_and_postprocess(batch)
         finally:
             if force_sequential:
                 submodule.can_batch = original  # type: ignore[method-assign]
             self.engine.finalize_batch(batch)
-        if output.failed_requests:
-            raise AssertionError(f"engine reported failed requests: {output.failed_requests}")
-        if output.allocation_failed and not allow_alloc_failure:
-            raise AssertionError(
-                f"unexpected page allocation failure for {output.alloc_failed_request_id} "
-                f"(short {output.alloc_pages_short} pages)"
-            )
+        if batch.failed_requests:
+            raise AssertionError(f"engine reported failed requests: {batch.failed_requests}")
+        if batch.admit_error is not None and not allow_alloc_failure:
+            raise AssertionError(f"unexpected resource admission failure: {batch.admit_error}")
         return output
 
-    def tokens(self, output: NodeOutput) -> dict[str, int]:
-        return {rid: int(out["new_token"][0].reshape(-1)[0]) for rid, out in output.per_request_output_tensors.items()}
+    def tokens(self, output: dict[str, dict[str, list[torch.Tensor]]]) -> dict[str, int]:
+        tokens: dict[str, int] = {}
+        sampler = self.engine._resources[SAMPLER]
+        for rid, out in output.items():
+            if "new_token" in out:
+                tokens[rid] = int(out["new_token"][0].reshape(-1)[0])
+            else:
+                # The resource engine's unbatched path calls ``forward`` and
+                # returns logits; production worker postprocessing samples
+                # those rows. Mirror that outer sampling seam here so the
+                # sequential reference remains semantically equivalent to the
+                # packed ``forward_batched`` path.
+                tokens[rid] = int(sampler.sample([rid], out["logits"][0])[0])
+        return tokens
 
     @contextlib.contextmanager
     def capture_logits(self) -> Iterator[list[torch.Tensor]]:
@@ -569,31 +573,64 @@ def build_llm_engine(
 ) -> LLMEngine:
     config = config or make_tiny_config()
     text = config.text_config
-    language_model = language_model or build_language_model(config, target, seed=seed)
+    if language_model is None:
+        language_model = build_language_model(config, target, seed=seed)
+    else:
+        # Resource binding is mutable: each attention layer holds the KV and
+        # attention resources of the Engine that owns it. A batched/reference
+        # comparison therefore needs equal *weights* in separate module
+        # instances, just as two real workers do; sharing one module would
+        # silently rebind the first engine to the second engine's resources.
+        source_state = language_model.state_dict()
+        language_model = QwenVLForCausalLM(config)
+        language_model.load_state_dict(source_state)
+        language_model = language_model.to(device=target.device, dtype=target.dtype).eval()
     submodule = QwenVLLLMSubmodule(language_model, config)
-    kv_config = KVCacheConfig(
+    kv_config = KVConfig(
         num_layers=text.num_hidden_layers,
         num_kv_heads=text.num_key_value_heads,
         head_dim=text.head_dim,
         max_seq_len=max_seq_len,
-        max_num_pages=max_num_pages,
+        # Sink page zero is owned by the resource engine, so allocate one
+        # additional physical page to preserve the caller's usable budget.
+        max_num_pages=max_num_pages + 1,
         page_size=page_size,
         num_qo_heads=text.num_attention_heads,
-        nodes=[LLM_NODE],
-        attention_backend=target.backend,
     )
-    engine = KVCacheEngine(autocast_dtype=target.dtype)
+    attn_spec: NodeResourceSpec
+    if target.backend == DENSE_REFERENCE_BACKEND:
+        attn_spec = DenseReferenceAttentionSpec(
+            resource_key=ATTN,
+            nodes={LLM_NODE},
+            config=AttentionConfig(kv_cache=KV_CACHE),
+        )
+    else:
+        attn_spec = AttentionSpec(
+            resource_key=ATTN,
+            nodes={LLM_NODE},
+            config=AttentionConfig(kv_cache=KV_CACHE),
+        )
+    engine = Engine(autocast_dtype=target.dtype)
     engine.load_model(
         {LLM_NODE: submodule},
+        specs=[
+            KVSpec(resource_key=KV_CACHE, nodes={LLM_NODE}, config=kv_config),
+            attn_spec,
+            PositionSpec(resource_key=POS, nodes={LLM_NODE}, config=PositionConfig(kv_cache=KV_CACHE)),
+            SamplerSpec(
+                resource_key=SAMPLER,
+                nodes={LLM_NODE},
+                vocab_size=text.vocab_size,
+                enable_repetion_penalty=True,
+            ),
+        ],
         parallel_groups=WorkerParallelGroups(global_rank=0, num_workers=1),
-        kv_cache_config=[kv_config],
         device=target.device,
         transfer_engine_info=TransferEngineInfo(
             my_entity_id="worker0",
             my_session_id="local",
             transfer_engine=LocalTransferEngine("localhost"),
         ),
-        default_sampling_config={LLM_NODE: greedy_sampling(config)},
         kv_cache_type=target.dtype,
     )
     return LLMEngine(engine=engine, submodule=submodule, config=config, target=target, kv_config=kv_config)
@@ -683,13 +720,13 @@ def vision_prompt(
     return VisionPrompt(ids=ids, grid=grid, vision_embeds=vision, deepstack=deepstack)
 
 
-def prefill_batch(handle: LLMEngine, prompts: dict[str, TextPrompt | VisionPrompt]) -> NodeBatch:
+def prefill_batch(handle: LLMEngine, prompts: dict[str, TextPrompt | VisionPrompt]) -> ExecutingBatch:
     walks = {"prefill_vision" if isinstance(p, VisionPrompt) else "prefill" for p in prompts.values()}
     assert len(walks) == 1, f"a prefill batch must be single-walk; got {sorted(walks)}"
     return handle.batch(walks.pop(), {rid: prompt.tensors(handle.config) for rid, prompt in prompts.items()})
 
 
-def decode_batch(handle: LLMEngine, tokens: dict[str, int]) -> NodeBatch:
+def decode_batch(handle: LLMEngine, tokens: dict[str, int]) -> ExecutingBatch:
     return handle.batch(
         "decode",
         {rid: {"text_inputs": [torch.tensor([token], dtype=torch.long)]} for rid, token in tokens.items()},
@@ -707,7 +744,7 @@ class StepResult:
         return top2_margin(self.logits[rid])
 
 
-def _run_step(handle: LLMEngine, batch: NodeBatch, *, sequential: bool) -> StepResult:
+def _run_step(handle: LLMEngine, batch: ExecutingBatch, *, sequential: bool) -> StepResult:
     rids = list(batch.request_ids)
     with handle.capture_logits() as captured:
         output = handle.run(batch, force_sequential=sequential)

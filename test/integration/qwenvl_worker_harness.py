@@ -1,7 +1,7 @@
 """In-process worker harness for the PR1 QwenVL scheduler tests (P1-G1).
 
 Assembles the production worker stack for a single-rank deployment --
-``EngineManager.build`` (real ``KVCacheEngine`` + ``StatelessEngine``),
+``EngineManager.build`` (the resource-pool ``Engine``),
 ``WorkerGraphsManager`` + ``WorkerGraphQueues`` built from the QwenVL model's
 own ``get_graph_walk_graphs`` declaration, ``MicroScheduler`` and a
 ``TensorCommunicationManager`` -- and drives it with the same call sequence
@@ -11,7 +11,7 @@ pieces replaced are the transports: tensors live in the local
 (``WORKER_GRAPHS_DONE`` -> ``get_partition_forward_pass_args`` -> next walk)
 is executed inline instead of over ZMQ.
 
-Every ``ScheduledBatch`` the scheduler emits, and every ``NodeBatch`` that
+Every ``ScheduledBatch`` the scheduler emits, and every ``ExecutingBatch`` that
 reaches an engine's ``execute_batch``, is recorded in ``observed`` so tests
 can assert the batch shapes (node, walk, request ids) that actually ran.
 """
@@ -30,8 +30,8 @@ from torch import nn
 from mstar.communication.tensors import LocalTransferEngine, TensorCommunicationManager
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import WorkerParallelGroups
-from mstar.engine.base import NodeBatch, NodeOutput
-from mstar.engine.kv_store import KVCacheConfig, TransferEngineInfo
+from mstar.engine.engine import ExecutingBatch
+from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.model.qwenvl.qwenvl_model import QwenVLModel
 from mstar.model.qwenvl.submodules import QwenVLLLMSubmodule, QwenVLVisionSubmodule
@@ -79,7 +79,7 @@ class TinyQwenVLModel(QwenVLModel):
     modules. Graph declaration, forward-pass args, sampling config and
     sharding config are inherited unchanged."""
 
-    def __init__(self, config, target: H.Target, *, seed: int, max_output_tokens: int, kv_config: KVCacheConfig):
+    def __init__(self, config, target: H.Target, *, seed: int, max_output_tokens: int, kv_config: H.KVConfig):
         self.config = config
         self.target = target
         self._max_output_tokens = max_output_tokens
@@ -99,8 +99,18 @@ class TinyQwenVLModel(QwenVLModel):
     def get_max_output_tokens(self, **model_kwargs):
         return self._max_output_tokens
 
-    def get_kv_cache_config(self):
-        return [self._kv_config]
+    def get_node_resources(self):
+        specs = super().get_node_resources()
+        for index, spec in enumerate(specs):
+            if spec.resource_key == H.KV_CACHE:
+                spec.config = self._kv_config
+            elif spec.resource_key == H.ATTN and self.target.backend == H.DENSE_REFERENCE_BACKEND:
+                specs[index] = H.DenseReferenceAttentionSpec(
+                    resource_key=H.ATTN,
+                    nodes={H.LLM_NODE},
+                    config=H.AttentionConfig(kv_cache=H.KV_CACHE),
+                )
+        return specs
 
     def get_autocast_dtype(self):
         return self.target.dtype
@@ -217,16 +227,17 @@ class QwenVLWorker:
         self.target = target
         self.config = config or H.make_tiny_config()
         text = self.config.text_config
-        self.kv_config = KVCacheConfig(
+        self.kv_config = H.KVConfig(
             num_layers=text.num_hidden_layers,
             num_kv_heads=text.num_key_value_heads,
             head_dim=text.head_dim,
             max_seq_len=4096,
-            max_num_pages=max_num_pages,
+            # The resource KV manager reserves sink page zero for capture
+            # padding, preserving ``max_num_pages`` as the harness's usable
+            # capacity requires one additional physical page.
+            max_num_pages=max_num_pages + 1,
             page_size=page_size,
             num_qo_heads=text.num_attention_heads,
-            nodes=[H.LLM_NODE],
-            attention_backend=target.backend,
         )
         self.max_output_tokens = max_output_tokens
         self.model = TinyQwenVLModel(
@@ -237,7 +248,6 @@ class QwenVLWorker:
         self.engine_manager = EngineManager.build(
             node_names={H.LLM_NODE, VISION_NODE},
             device=target.device,
-            kv_config=[self.kv_config],
             model_config={"autocast_dtype": target.dtype},
             parallel_groups=self.parallel_groups,
             transfer_engine_info=TransferEngineInfo(
@@ -306,22 +316,28 @@ class QwenVLWorker:
 
     @property
     def alloc_manager(self):
-        return self.llm_engine.submodule_management[H.LLM_NODE].kv_management.alloc_manager
+        from types import SimpleNamespace
+
+        return SimpleNamespace(request_states=self.kv._streams)
+
+    @property
+    def kv(self):
+        return self.llm_engine._resources[H.KV_CACHE]
 
     @property
     def free_pages(self) -> int:
-        return self.alloc_manager.num_free_pages
+        return self.kv._arena.num_free
 
     @property
     def total_pages(self) -> int:
-        return self.alloc_manager.total_pages
+        return self.kv.config.max_num_pages - 1
 
     @property
     def sampler(self):
-        return self.llm_engine.submodule_management[H.LLM_NODE].sampler.main
+        return self.llm_engine._resources[H.SAMPLER]._sampler
 
     def page_indices(self, rid: str) -> list[int]:
-        return list(self.alloc_manager.get_state(rid, "main").page_indices)
+        return list(self.kv._streams[rid]["main"].page_indices)
 
     def active_requests(self) -> set[str]:
         return set(self.graphs_manager.per_request_info)
@@ -365,18 +381,19 @@ class QwenVLWorker:
                 self.tensor_manager.increment_ref(rid, info.uuid)
         fwd_args = self.model.get_initial_forward_pass_args(PARTITION, modalities, ["text"], infos)
         metadata = fwd_args.full_metadata
-        sampling = sampling or self.model.resolve_sampling_configs(H.LLM_NODE, {"ignore_eos": True})
+        resource_configs = self.model.get_request_resource_configs({PARTITION: fwd_args}, {"ignore_eos": True})
+        if sampling is not None:
+            resource_configs[H.SAMPLER] = sampling
         fwd_info = CurrentForwardPassInfo(
             request_id=rid,
             graph_walk=metadata.graph_walk,
-            requires_cfg=False,
             fwd_index=0,
             random_seed=0,
             max_tokens=self.max_output_tokens,
-            sampling_config={H.LLM_NODE: sampling},
+            resource_configs=resource_configs,
             partition_name=PARTITION,
         )
-        self.engine_manager.add_request(rid)
+        self.engine_manager.add_request(rid, resource_configs)
         self.graphs_manager.add_request(
             rid,
             partition_worker_graph_ids=list(self.worker_graphs),
@@ -412,7 +429,8 @@ class QwenVLWorker:
                 lambda _m, _i, out: captured.append(out.detach().float().cpu())
             )
         try:
-            output = engine.execute_batch(node_batch)
+            engine.prepare_inputs(node_batch)
+            output = engine.exec_and_postprocess(node_batch)
         finally:
             if hook is not None:
                 hook.remove()
@@ -426,14 +444,14 @@ class QwenVLWorker:
                 engine_request_ids=tuple(node_batch.request_ids),
                 lm_head_launches=len(captured),
                 lm_head_rows=(sum(t.shape[0] for t in captured) if captured else None),
-                allocation_failed=bool(output.allocation_failed),
+                allocation_failed=node_batch.admit_error is not None,
             )
         )
-        if output.failed_requests:
+        if node_batch.failed_requests:
             raise AssertionError(
-                f"engine failed requests {output.failed_requests} in {batch.node_name}/{batch.graph_walk}"
+                f"engine failed requests {node_batch.failed_requests} in {batch.node_name}/{batch.graph_walk}"
             )
-        if output.allocation_failed:
+        if node_batch.admit_error is not None:
             self.oom_events.append((self._step, batch.graph_walk, tuple(batch.node_objects.keys())))
             for rid, node in batch.node_objects.items():
                 self.graphs_manager.queues[batch.request_to_worker_graph[rid]].push_back_node(rid, node)
@@ -485,7 +503,7 @@ class QwenVLWorker:
 
     # -- worker internals (mirrors Worker._build_node_batch / _postprocess_batch)
 
-    def _build_node_batch(self, batch: ScheduledBatch) -> NodeBatch:
+    def _build_node_batch(self, batch: ScheduledBatch) -> ExecutingBatch:
         per_request_inputs = {}
         per_request_info = {}
         for rid, node in batch.node_objects.items():
@@ -494,15 +512,19 @@ class QwenVLWorker:
                 tensors[input_name] = [self.tensor_manager.get_tensor(rid, info.uuid) for info in edge.tensor_info]
             per_request_inputs[rid] = tensors
             per_request_info[rid] = self.graphs_manager.get_fwd_info(rid, PARTITION)
-        return NodeBatch(
+        return ExecutingBatch(
             node_name=batch.node_name,
-            graph_walk=batch.graph_walk,
-            request_ids=list(batch.node_objects.keys()),
+            step_context=H.StepContext(
+                request_ids=list(batch.node_objects.keys()),
+                graph_walk=batch.graph_walk,
+                slot=0,
+                capture=False,
+            ),
             per_request_input_tensors=per_request_inputs,
             per_request_info=per_request_info,
         )
 
-    def _postprocess(self, batch: ScheduledBatch, node_batch: NodeBatch, output: NodeOutput) -> None:
+    def _postprocess(self, batch: ScheduledBatch, node_batch: ExecutingBatch, output: dict) -> None:
         for node in batch.node_objects.values():
             node.ready_signals.clear()
         for rid, req_info in node_batch.per_request_info.items():
@@ -510,31 +532,39 @@ class QwenVLWorker:
             self.records[rid].walks.append((batch.node_name, batch.graph_walk))
 
         engine = self.engine_manager.get_engine(batch.node_name)
-        stop_result = engine.check_stop_for_batch(node_batch, output)
-        assert not stop_result.failed_requests, stop_result.failed_requests
-        for rid, loop_names in stop_result.stops.items():
+        stops = engine.check_stop_for_batch(node_batch, output)
+        assert not node_batch.failed_requests, node_batch.failed_requests
+        for rid, loop_names in stops.items():
             loop_names = {name for name in loop_names if self.graphs_manager.check_dyn_loop(rid, PARTITION, name)}
             if loop_names:
                 self.graphs_manager.stop_loops(
-                    rid, partition=PARTITION, loop_names=loop_names,
-                    req_info=node_batch.per_request_info[rid], last_node_run=batch.node_name,
+                    rid,
+                    partition=PARTITION,
+                    loop_names=loop_names,
+                    req_info=node_batch.per_request_info[rid],
+                    last_node_run=batch.node_name,
                 )
 
         for rid, wg_id in batch.request_to_worker_graph.items():
             node = batch.node_objects[rid]
             node.reset_outputs()
-            req_output = output.per_request_output_tensors.get(rid)
+            req_output = output.get(rid)
             uuids: set[str] = set()
             if req_output:
                 infos = self.tensor_manager.store_and_populate_graph_edges(
-                    request_id=rid, tensors=req_output, graph_edges=node.outputs,
-                    node_name=node.name, graph_walk=batch.graph_walk,
-                    skip_cuda_sync=True, skip_ref_count=True,
+                    request_id=rid,
+                    tensors=req_output,
+                    graph_edges=node.outputs,
+                    node_name=node.name,
+                    graph_walk=batch.graph_walk,
+                    skip_cuda_sync=True,
+                    skip_ref_count=True,
                 )
                 uuids = {info.uuid for entries in infos.values() for info in entries}
             completion = self.graphs_manager.mark_node_complete(rid, wg_id, batch.node_name)
             routing = self.graphs_manager.process_node_outputs(
-                rid, node_name=batch.node_name,
+                rid,
+                node_name=batch.node_name,
                 outputs=[edge.clone() for edge in completion.output_edges],
                 graph_walk=batch.graph_walk,
             )
@@ -543,8 +573,11 @@ class QwenVLWorker:
                     for info in edge.tensor_info:
                         self.tensor_manager.set_persist(rid, info.uuid, True)
                 routed = (
-                    routing.routed_to_this_worker_graph + routing.emit_to_client + routing.streaming_local
-                    + sum(routing.to_workers.values(), start=[]) + sum(routing.streaming_to_workers.values(), start=[])
+                    routing.routed_to_this_worker_graph
+                    + routing.emit_to_client
+                    + routing.streaming_local
+                    + sum(routing.to_workers.values(), start=[])
+                    + sum(routing.streaming_to_workers.values(), start=[])
                 )
                 self.tensor_manager.set_output_ref_counts(rid, uuids, routed)
             assert not routing.to_workers, f"single-worker harness routed edges off-worker: {routing.to_workers}"
@@ -580,9 +613,7 @@ class QwenVLWorker:
             self._conductor_num_output_tokens[rid] += count
         self.graphs_manager.flush_output_signals(rid)
         metadata = self._conductor_metadata[rid]
-        fwd_args = self.model.get_partition_forward_pass_args(
-            PARTITION, metadata, self._conductor_persist[rid]
-        )
+        fwd_args = self.model.get_partition_forward_pass_args(PARTITION, metadata, self._conductor_persist[rid])
         self._conductor_metadata[rid] = fwd_args.full_metadata
         fwd_args.full_metadata.kwargs.update(fwd_args.step_metadata)
         if self._conductor_num_output_tokens[rid] >= self.max_output_tokens:
@@ -592,17 +623,14 @@ class QwenVLWorker:
             return
         previous = self.graphs_manager.get_fwd_info(rid, PARTITION)
         next_seed = previous.random_seed + 1
-        for cfg in previous.sampling_config.values():
-            cfg.set_seed(next_seed)
         next_info = CurrentForwardPassInfo(
             request_id=rid,
             graph_walk=fwd_args.full_metadata.graph_walk,
-            requires_cfg=False,
             fwd_index=previous.fwd_index + 1,
             random_seed=next_seed,
             max_tokens=self.max_output_tokens,
-            sampling_config=previous.sampling_config,
-            per_label_seq_info=previous.per_label_seq_info,
+            resource_configs=previous.resource_configs,
+            resource_publish_info=previous.resource_publish_info,
             partition_name=PARTITION,
         )
         self.graphs_manager.update_request_info(rid, PARTITION, current_fwd_info=next_info)
@@ -625,10 +653,7 @@ class QwenVLWorker:
 
 
 def llm_batches(observed: list[BatchObservation], graph_walk: str | None = None) -> list[BatchObservation]:
-    return [
-        obs for obs in observed
-        if obs.node == H.LLM_NODE and (graph_walk is None or obs.graph_walk == graph_walk)
-    ]
+    return [obs for obs in observed if obs.node == H.LLM_NODE and (graph_walk is None or obs.graph_walk == graph_walk)]
 
 
 def isolated_run(

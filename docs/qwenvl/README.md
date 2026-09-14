@@ -30,8 +30,8 @@ acceptance claim.
 | Location | Label | Notes |
 | --- | --- | --- |
 | `test/modular/qwenvl/` | Component | fake `Cache`, direct `preprocess`/`forward_batched`; pins the P1-G6 eager-only decision |
-| `test/integration/test_qwenvl_attention_parity.py` | Integration (`cuda-flashinfer-bf16` rows) | P1-G5: FlashInfer vs dense SDPA reference through `KVCacheEngine` |
-| `test/integration/test_qwenvl_batched_engine.py` | Integration | P1-G2: `_execute_batched` vs `_execute_sequential`, B∈{2,4,8} |
+| `test/integration/test_qwenvl_attention_parity.py` | Integration (`cuda-flashinfer-bf16` rows) | P1-G5: resource-pool FlashInfer versus dense SDPA reference over the same production KV pages |
+| `test/integration/test_qwenvl_batched_engine.py` | Integration | P1-G2: packed resource-engine forward versus its per-request fallback, B∈{2,4,8} |
 | `test/integration/test_qwenvl_scheduler_batching.py` | Integration | P1-G1: batch shapes observed at `MicroScheduler` and engine entry |
 | `test/integration/test_qwenvl_lifecycle.py` | Integration | P1-G3/G4: perturbation isolation, completion, cancel, page reuse, OOM hold |
 

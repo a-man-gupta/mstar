@@ -153,8 +153,8 @@ sequenceDiagram
 
 | Piece | File | Role |
 | --- | --- | --- |
-| Engine harness | `test/integration/qwenvl_harness.py` | Builds a tiny QwenVL LLM on a real `KVCacheEngine` (`PagedAllocationManager`, `MultiSampler`, `LocalTransferEngine`); `run_prefill`/`run_decode` enter through `execute_batch` and can force the `_execute_sequential` reference path; `DenseReferenceCacheManager` is a registered attention backend that shares the paged store with FlashInfer but computes attention as dense fp32 SDPA with explicit GQA expansion and a causal mask |
-| Worker harness | `test/integration/qwenvl_worker_harness.py` | In-process `WorkerGraphsManager` + `MicroScheduler` (production default round-robin policy) + `EngineManager` over `QwenVLModel`'s real graph walks, with the conductor's NEW_REQUEST / WORKER_GRAPHS_DONE / decode-loop transitions replayed inline; records every batch at the scheduler and at engine entry (`lm_head` launch count + rows) |
+| Engine harness | `test/integration/qwenvl_harness.py` | Builds a tiny QwenVL LLM on the real resource-pool `Engine`: `KVSpec`/`KVManager`, `AttentionSpec`/`FlashInferManager`, position and sampler resources, and `LocalTransferEngine`. `run_prefill`/`run_decode` enter through `prepare_inputs → exec_and_postprocess → finalize_batch`; the isolated reference is the same engine's per-request fallback. A test-local SDPA attention *resource* consumes the production KV plan/pages to independently oracle FlashInfer without introducing a runtime compatibility path |
+| Worker harness | `test/integration/qwenvl_worker_harness.py` | In-process `WorkerGraphsManager` + `MicroScheduler` (production default round-robin policy) + the current single resource-pool `EngineManager` over QwenVL's real graph walks, with the conductor's NEW_REQUEST / WORKER_GRAPHS_DONE / decode-loop transitions replayed inline; records every batch at the scheduler and at resource-engine entry (`lm_head` launch count + rows) |
 | Evidence collector | `benchmark/qwenvl_acceptance.py batch` | Runs the suites below and folds per-test outcomes into a per-gate verdict JSON (Integration rows = `cuda-flashinfer-bf16` parametrisations; `cpu-dense-fp32` rows are reported as dry run) |
 
 Every engine/worker test is parametrised over two targets. Only the CUDA row
@@ -162,8 +162,8 @@ is acceptance evidence:
 
 | Target id | Device / backend / dtype | Evidence label |
 | --- | --- | --- |
-| `cuda-flashinfer-bf16` | CUDA, `FlashInferCacheManager`, bf16 (`-m cuda`) | **Integration** |
-| `cpu-dense-fp32` | CPU, `DenseReferenceCacheManager`, fp32 | Component (harness dry run) |
+| `cuda-flashinfer-bf16` | CUDA, resource-pool `FlashInferManager`, bf16 (`-m cuda`) | **Integration** |
+| `cpu-dense-fp32` | CPU, test-local SDPA attention resource over production KV pages, fp32 | Component (harness dry run) |
 
 Tolerance: fp32 rows must match to `rtol=atol=1e-5`; bf16 FlashInfer rows use
 `rtol=1e-2, atol=2e-2` on last-token logits (Qwen3-Omni CUDA-graph precedent),
@@ -175,7 +175,7 @@ within that noise band. Sampling is greedy throughout the parity tests.
 | Gate | Suite | Cases |
 | --- | --- | --- |
 | P1-G1 | `test_qwenvl_scheduler_batching.py` | text prefill co-batch B∈{2,4,8} then shared decode; `prefill_vision` co-batch B∈{2,4} after a batched vision-encoder step; text + image requests prefill on separate walks then share one decode batch; late arrival prefills alone and joins the running decode batch; engine sees exactly the scheduled id set for every batch. Every co-batched stream is compared with the same request alone on a fresh worker |
-| P1-G2 | `test_qwenvl_batched_engine.py` | `_execute_batched` vs `_execute_sequential` on identical weights: text prefill B∈{2,4,8}, `prefill_vision` B∈{2,4} with different grids, decode B∈{2,4,8}, image-origin decode B∈{2,4,8}, mixed text/image-origin decode (plus a literal alone-on-a-fresh-engine cross-check) |
+| P1-G2 | `test_qwenvl_batched_engine.py` | Resource-engine packed `forward_batched` versus its per-request execution fallback on identical weights: text prefill B∈{2,4,8}, `prefill_vision` B∈{2,4} with different grids, decode B∈{2,4,8}, image-origin decode B∈{2,4,8}, mixed text/image-origin decode (plus a literal alone-on-a-fresh-engine cross-check) |
 | P1-G3 | `test_qwenvl_lifecycle.py` | perturb one request's image grid / image features / prompt length / sampler in a B=4 batch, other three unchanged; per-request sampler config and seen-token state, hot vs greedy rows on identical prompts |
 | P1-G4 | `test_qwenvl_lifecycle.py` | `remove_request` frees pages and sampler state, others keep KV; cancel mid-decode (engine and worker) with survivors matching the reference; pool fill → free → readmit onto recycled pages equals a fresh engine; worker completion by token limit and by EOS; late arrivals refused pages are held by the scheduler and admitted on recycled pages once the first wave completes |
 | P1-G5 | `test_qwenvl_attention_parity.py` | incremental decode = one-shot prefill at 127/128/129/257 tokens (page_size 128); causal: prefix hidden states unchanged by an appended suffix or a second packed request; unequal-length packed batches = isolated; FlashInfer vs dense reference on the same device for prefill + 3 decode steps at B=3 (page boundary), B=4 (16/64/100/128), B=8 (mixed), and `prefill_vision` with two grids; GQA precondition on the tiny config |
@@ -242,6 +242,11 @@ remains a PR 1 non-goal.
 Counts are what `benchmark/qwenvl_acceptance.py batch --allow-cpu-only` reports
 on a CUDA-less host; the collector marks every CUDA gate `not collected` until
 the `-m cuda` rows run.
+
+The harness is deliberately ported to the resource-pool engine rather than
+retaining imports from the removed `mstar.engine.kv_store`, `cache_manager`, or
+`kv_cache_engine` modules. This keeps the CUDA acceptance run on the same
+execution architecture that production QwenVL uses.
 
 PR 1 is merge-ready only when the CUDA column is collected green on the
 qualifying GPU:

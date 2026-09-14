@@ -26,7 +26,7 @@ single-GPU CUDA serving, TP2 numerical parity, or throughput.
 
 The PR1 continuous-batching gates (P1-G1 .. P1-G5) are proven by the
 **Integration** suites in `test/integration/test_qwenvl_*.py`, which enter
-through the real `KVCacheEngine`, `MicroScheduler` and `WorkerGraphsManager`
+through the real resource-pool `Engine`, `MicroScheduler` and `WorkerGraphsManager`
 (see `docs/qwenvl/PR_1_CONTINUOUS_BATCHING.md` §Evidence). Their
 `cpu-dense-fp32` parametrisations run here on CPU as a harness dry run; only
 the `cuda-flashinfer-bf16` rows (`-m cuda`) are acceptance evidence.
