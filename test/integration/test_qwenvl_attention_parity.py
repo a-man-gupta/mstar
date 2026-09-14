@@ -167,6 +167,10 @@ def test_flashinfer_target_uses_sm87_valid_head_geometry() -> None:
     assert config.text_config.hidden_size == 128
     assert config.text_config.rope_scaling["mrope_section"] == [8, 12, 12]
     assert config.vision_config.out_hidden_size == 128
+    prompt = H.vision_prompt((1, 4, 4), seed=0)
+    tensors = prompt.tensors(config)
+    assert tensors["vision_embeds"][0].shape[-1] == 128
+    assert all(tensor.shape[-1] == 128 for tensor in tensors["deepstack_visual_embeds"])
 
 
 @pytest.mark.cuda

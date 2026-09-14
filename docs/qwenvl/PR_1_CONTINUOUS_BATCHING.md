@@ -179,6 +179,10 @@ output width follows the same 128-wide text state. This is required because the
 Orin SM87 FlashInfer 0.6.18 JIT rejects 8/16/32-dimensional heads while a
 64-dimensional head executes successfully. It is not a production model
 configuration: the selected Qwen3-VL checkpoint uses head dimension 128.
+Synthetic vision and DeepStack fixtures are materialized at the receiving model
+width, so the CPU fixture's compact 16-wide values are explicitly zero-extended
+for the 128-wide CUDA target instead of crossing the embedding seam with an
+invalid shape.
 
 ### Gate → tests
 

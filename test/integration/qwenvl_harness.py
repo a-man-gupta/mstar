@@ -705,11 +705,28 @@ class VisionPrompt:
         return int(self.position_ids(config).max()) + 1
 
     def tensors(self, config) -> dict[str, list[torch.Tensor]]:
+        hidden_size = config.text_config.hidden_size
+
+        def feature_width(tensor: torch.Tensor) -> torch.Tensor:
+            if tensor.shape[-1] == hidden_size:
+                return tensor
+            if tensor.shape[-1] > hidden_size:
+                raise ValueError(
+                    f"Synthetic QwenVL vision feature width {tensor.shape[-1]} exceeds "
+                    f"the receiving model width {hidden_size}."
+                )
+            # CPU fixtures retain their compact 16-wide source features. The
+            # CUDA FlashInfer target widens the receiving text model to 128;
+            # preserve the fixture values and explicitly zero-extend the
+            # artificial unused channels rather than passing a mismatched
+            # vision tensor into the production embedding seam.
+            return F.pad(tensor, (0, hidden_size - tensor.shape[-1]))
+
         return {
             "text_inputs": [self.ids],
             "position_ids": [self.position_ids(config)],
-            "vision_embeds": [self.vision_embeds],
-            "deepstack_visual_embeds": list(self.deepstack),
+            "vision_embeds": [feature_width(self.vision_embeds)],
+            "deepstack_visual_embeds": [feature_width(tensor) for tensor in self.deepstack],
         }
 
 

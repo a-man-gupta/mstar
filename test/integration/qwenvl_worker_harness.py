@@ -226,6 +226,7 @@ class QwenVLWorker:
     ):
         self.target = target
         self.config = config or H.make_tiny_config()
+        H.configure_flashinfer_geometry(self.config, target)
         text = self.config.text_config
         self.kv_config = H.KVConfig(
             num_layers=text.num_hidden_layers,
