@@ -361,6 +361,33 @@ def make_tiny_config(**overrides):
     return config
 
 
+def configure_flashinfer_geometry(config, target: Target):
+    """Make the CUDA oracle geometry valid for FlashInfer on SM87.
+
+    The compact CPU dry-run model intentionally uses ``head_dim=8``. The
+    Orin's real FlashInfer JIT rejects 8, 16, and 32, while 64 succeeds; the
+    production Qwen3-VL checkpoint uses 128. For the CUDA target only, widen
+    the synthetic model to the smallest observed valid dimension and keep all
+    dependent widths/MRoPE sections coherent. This is test geometry, not a
+    serving-model configuration change.
+    """
+    if not target.is_flashinfer or config.text_config.head_dim >= 64:
+        return config
+
+    text = config.text_config
+    text.head_dim = 64
+    text.hidden_size = text.num_attention_heads * text.head_dim
+    text.intermediate_size = text.hidden_size * 2
+    text.moe_intermediate_size = text.hidden_size // 4
+    text.rope_scaling = {
+        **(text.rope_scaling or {}),
+        "mrope_section": [8, 12, 12],
+        "mrope_interleaved": True,
+    }
+    config.vision_config.out_hidden_size = text.hidden_size
+    return config
+
+
 def randomize_parameters(module: torch.nn.Module, seed: int, std: float = 0.2) -> None:
     """Deterministically initialise every parameter (M*'s parallel layers
     allocate with ``torch.empty`` and expect a checkpoint to fill them)."""
@@ -374,6 +401,7 @@ def randomize_parameters(module: torch.nn.Module, seed: int, std: float = 0.2) -
 
 
 def build_language_model(config, target: Target, seed: int = 0) -> QwenVLForCausalLM:
+    configure_flashinfer_geometry(config, target)
     model = QwenVLForCausalLM(config)
     randomize_parameters(model, seed)
     return model.to(device=target.device, dtype=target.dtype).eval()
@@ -572,6 +600,7 @@ def build_llm_engine(
     language_model: QwenVLForCausalLM | None = None,
 ) -> LLMEngine:
     config = config or make_tiny_config()
+    configure_flashinfer_geometry(config, target)
     text = config.text_config
     if language_model is None:
         language_model = build_language_model(config, target, seed=seed)

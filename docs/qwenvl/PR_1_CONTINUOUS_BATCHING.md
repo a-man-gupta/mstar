@@ -170,6 +170,16 @@ Tolerance: fp32 rows must match to `rtol=atol=1e-5`; bf16 FlashInfer rows use
 and a greedy stream may diverge only at a step whose reference top-2 margin is
 within that noise band. Sampling is greedy throughout the parity tests.
 
+### FlashInfer CUDA test geometry
+
+The CPU dry-run model retains `head_dim=8` for fast local coverage. The CUDA
+FlashInfer target widens only its synthetic test configuration to
+`head_dim=64`, `hidden_size=128`, and MRoPE sections `[8,12,12]`; its vision
+output width follows the same 128-wide text state. This is required because the
+Orin SM87 FlashInfer 0.6.18 JIT rejects 8/16/32-dimensional heads while a
+64-dimensional head executes successfully. It is not a production model
+configuration: the selected Qwen3-VL checkpoint uses head dimension 128.
+
 ### Gate → tests
 
 | Gate | Suite | Cases |

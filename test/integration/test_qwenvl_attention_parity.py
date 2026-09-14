@@ -158,6 +158,17 @@ def test_tiny_config_exercises_gqa() -> None:
     assert text.num_attention_heads % text.num_key_value_heads == 0
 
 
+def test_flashinfer_target_uses_sm87_valid_head_geometry() -> None:
+    """The compact CPU dry-run uses head_dim=8; the CUDA target must widen
+    before FlashInfer JIT is invoked on SM87."""
+    config = H.make_tiny_config()
+    H.configure_flashinfer_geometry(config, H.cuda_flashinfer_target())
+    assert config.text_config.head_dim == 64
+    assert config.text_config.hidden_size == 128
+    assert config.text_config.rope_scaling["mrope_section"] == [8, 12, 12]
+    assert config.vision_config.out_hidden_size == 128
+
+
 @pytest.mark.cuda
 @pytest.mark.parametrize(
     "lengths",
