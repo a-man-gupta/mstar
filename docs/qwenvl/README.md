@@ -14,6 +14,7 @@ own runtime acceptance gates pass.
 | [Single-GPU correctness](PR_0_SINGLE_GPU_CORRECTNESS.md) | Official config/checkpoint mapping, image/text graph, MRoPE, bounded KV residency, and greedy decode | Local non-TP baseline only |
 | [Continuous batching](PR_1_CONTINUOUS_BATCHING.md) | Same-walk batching guards, paged-attention ownership, isolation/lifecycle gates, engine + worker integration harness, eager-only CUDA-graph scope | Continuous batching + paged attention on one GPU, once `benchmark/qwenvl_acceptance.py batch` reports every P1 gate `pass` on a CUDA + FlashInfer host |
 | [Tensor parallelism](PR_2_TENSOR_PARALLELISM.md) | TP topology, exact shard contracts, and TP2-vs-TP1 acceptance | Design only; distributed parity evidence required |
+| [Target-scale memory planning](PR_3_MEMORY_PLANNING.md) | Per-rank memory budgeting, admission, and sustained-run gates | Design only; target-hardware evidence required |
 
 ## Evidence labels
 
