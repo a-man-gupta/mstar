@@ -97,7 +97,7 @@ TINY_IMAGE_TOKEN_ID = 30
 # BF16 FlashInfer uses different reduction trees for prefill/decode and packed
 # rows than the fp32 SDPA oracle. The complete SM87 Orin B=8 evidence bounded
 # stable top-two drift at abs=0.547 / rel=0.090, so retain a small margin over
-# that observed envelope while requiring the top-two token identities below.
+# that observed envelope while requiring the greedy token below.
 BF16_LOGITS_RTOL = 1e-1
 BF16_LOGITS_ATOL = 6e-1
 # fp32 dense-reference path: batched and isolated must agree to float noise.
@@ -838,9 +838,10 @@ def assert_logits_close(actual: torch.Tensor, expected: torch.Tensor, target: Ta
     actual_margin = float(actual_values[0] - actual_values[1])
     expected_margin = float(expected_values[0] - expected_values[1])
     if target.dtype != torch.float32:
-        assert torch.equal(actual_indices, expected_indices), (
-            f"{what}: bf16 top-two tokens diverged ({actual_indices.tolist()} vs {expected_indices.tolist()}); "
-            f"actual values={actual_values.tolist()}, expected values={expected_values.tolist()}"
+        assert actual_indices[0] == expected_indices[0], (
+            f"{what}: bf16 greedy token diverged ({int(actual_indices[0])} vs {int(expected_indices[0])}); "
+            f"actual top2={actual_indices.tolist()}/{actual_values.tolist()}, "
+            f"expected top2={expected_indices.tolist()}/{expected_values.tolist()}"
         )
     assert torch.allclose(actual, expected, rtol=rtol, atol=atol), (
         f"{what}: logits mismatch (max abs diff {float(diff.max()):.3e}, max rel-to-scale {rel:.3e}, "
@@ -864,29 +865,13 @@ def assert_greedy_streams_match(
     target: Target,
     what: str,
 ) -> None:
-    """Compare two greedy token streams.
+    """Greedy generation is an observable contract on every target.
 
-    On the fp32 dense path the streams must be identical. On the bf16
-    FlashInfer path a divergence is only tolerated when the reference's
-    top-2 logit margin at that step is within bf16 noise of the logits scale
-    (a pure close-call swap); everything before the divergence must match,
-    and the first divergence ends the comparison because the trajectories
-    are no longer comparable afterwards.
+    BF16 can reorder non-winning logits under different packed shapes, but it
+    may not change the emitted token or the resulting decode trajectory.
     """
-    if target.dtype == torch.float32:
-        assert actual == expected, f"{what}: token streams differ\nactual={actual}\nexpected={expected}"
-        return
-    assert expected_margins is not None and len(expected_margins) == len(expected)
-    rtol, atol = target.logits_tolerance
-    assert len(actual) == len(expected), f"{what}: stream lengths differ ({len(actual)} vs {len(expected)})"
-    for step, (a, e) in enumerate(zip(actual, expected, strict=True)):
-        if a == e:
-            continue
-        assert expected_margins[step] <= atol + rtol * 4.0, (
-            f"{what}: token streams diverge at step {step} ({a} vs {e}) with a clear reference "
-            f"margin of {expected_margins[step]:.3e}\nactual={actual}\nexpected={expected}"
-        )
-        return
+    del expected_margins, target
+    assert actual == expected, f"{what}: token streams differ\nactual={actual}\nexpected={expected}"
 
 
 def sync(target: Target) -> None:
