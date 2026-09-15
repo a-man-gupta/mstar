@@ -376,7 +376,7 @@ def batch_evidence(args: argparse.Namespace) -> None:
             "bf16_flashinfer": {
                 "rtol": bf16_rtol,
                 "atol": bf16_atol,
-                "note": "last-token logits; greedy token and complete greedy stream must match",
+                "note": "a greedy change is allowed only at a <=0.0625 bf16 top-two tie; later drift cascades",
             },
             "fp32_dense_reference": {"rtol": fp32_rtol, "atol": fp32_atol},
         },

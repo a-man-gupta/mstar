@@ -158,6 +158,21 @@ def test_tiny_config_exercises_gqa() -> None:
     assert text.num_attention_heads % text.num_key_value_heads == 0
 
 
+def test_bf16_greedy_tie_window_never_allows_a_clear_winner_flip() -> None:
+    target = H.Target(device=torch.device("cpu"), backend=H.FLASHINFER_BACKEND, dtype=torch.bfloat16)
+    near_tie_batched = torch.tensor([3.609375, 3.59375])
+    near_tie_isolated = torch.tensor([3.59375, 3.625])
+    H.assert_logits_close(near_tie_batched, near_tie_isolated, target, "near-tie winner flip")
+    H.assert_greedy_streams_match([0, 7], [1, 8], [0.03125, 1.0], target, "near-tie stream")
+
+    clear_batched = torch.tensor([3.75, 3.59375])
+    clear_isolated = torch.tensor([3.59375, 3.75])
+    with pytest.raises(AssertionError, match="outside the tie window"):
+        H.assert_logits_close(clear_batched, clear_isolated, target, "clear winner flip")
+    with pytest.raises(AssertionError, match="outside the bf16 tie window"):
+        H.assert_greedy_streams_match([0], [1], [0.125], target, "clear stream")
+
+
 def test_flashinfer_target_uses_sm87_valid_head_geometry() -> None:
     """The compact CPU dry-run uses head_dim=8; the CUDA target must widen
     before FlashInfer JIT is invoked on SM87."""

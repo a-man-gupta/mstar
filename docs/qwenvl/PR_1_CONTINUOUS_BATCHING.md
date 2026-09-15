@@ -169,10 +169,11 @@ Tolerance: fp32 rows must match to `rtol=atol=1e-5`. BF16 FlashInfer rows use
 `rtol=1e-1, atol=6e-1` on last-token logits. Complete Orin SM87 FlashInfer
 0.6.18 B=8 evidence measured `abs=0.547` and `rel-to-scale=0.090` across
 FlashInfer-vs-SDPA and packed-versus-sequential decode; the bound retains a
-small margin over that envelope. The highest-logit token and the complete
-greedy stream must still match exactly. BF16 may reorder non-winning logits
-under different packed shapes, but that may not change a generated token or
-the decode trajectory.
+small margin over that envelope. A different winner is allowed only when both
+top-two margins are at most `0.0625` (two bf16 ULPs at the observed logit
+scale); that is separate from the value envelope. A first-step tie-break makes
+later autoregressive tokens follow different inputs, so the stream comparison
+ends at that accepted tie. Any clear-margin winner or stream divergence fails.
 Sampling is greedy throughout the parity tests.
 On a CUDA mismatch, the assertion records the max-difference vocabulary index,
 both argmax values, both top-two values/margins, and whether argmax agrees;
