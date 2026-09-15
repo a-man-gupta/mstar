@@ -46,7 +46,10 @@ def _assert_matches_isolated(worker: W.QwenVLWorker, rid: str, target: H.Target,
         target, rid, record.prompt, seed=0, max_output_tokens=MAX_OUTPUT_TOKENS, **{**WORKER_KW, **isolated_kw}
     )
     assert len(record.tokens) == len(alone.tokens) == MAX_OUTPUT_TOKENS + 1, (rid, record.tokens, alone.tokens)
-    H.assert_greedy_streams_match(record.tokens, alone.tokens, alone.margins, target, f"{rid} co-batched vs alone")
+    try:
+        H.assert_greedy_streams_match(record.tokens, alone.tokens, alone.margins, target, f"{rid} co-batched vs alone")
+    except AssertionError as error:
+        raise AssertionError(f"{error}\nco-batched top2={record.top2}\nisolated top2={alone.top2}") from error
 
 
 def _walk_batches(observed, walk):
