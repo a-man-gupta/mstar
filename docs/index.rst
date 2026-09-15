@@ -56,3 +56,4 @@ vision-language-action policies, and world models — through a **Python SDK**, 
    qwenvl/PR_1_CONTINUOUS_BATCHING
    qwenvl/PR_2_TENSOR_PARALLELISM
    qwenvl/PR_3_MEMORY_PLANNING
+   qwenvl/PR_4_PERFORMANCE
